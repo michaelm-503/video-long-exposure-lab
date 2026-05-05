@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+from html import escape
 from pathlib import Path
 from typing import cast
 
@@ -22,6 +24,7 @@ from longexposure.stacking import accepted_frames, average_frames
 
 
 APP_TITLE = "Video Long Exposure Lab"
+INLIER_RATIO_RELAX_STEP = 0.05
 
 
 def _natural_media_width(width: float | int) -> int:
@@ -67,6 +70,107 @@ def _extraction_table(metadata: dict[str, float | int]) -> pd.DataFrame:
             ],
         }
     )
+
+
+def _render_summary_table(table: pd.DataFrame) -> None:
+    """Render a compact static two-column table without dataframe scrollbars."""
+    rows = "\n".join(
+        "<tr>"
+        f"<td>{escape(str(row.Metric))}</td>"
+        f"<td>{escape(str(row.Value))}</td>"
+        "</tr>"
+        for row in table.itertuples(index=False)
+    )
+    st.markdown(
+        f"""
+        <div style="
+            border: 1px solid #e6e8ef;
+            border-radius: 6px;
+            display: inline-block;
+            margin: 0.25rem 0 1rem 0;
+            overflow: hidden;
+        ">
+        <table class="summary-table" style="
+            border-collapse: collapse;
+            font-size: 0.875rem;
+            line-height: 1.35;
+            min-width: 250px;
+        ">
+            <thead>
+                <tr style="background: #f7f8fb;">
+                    <th style="border-bottom: 1px solid #e6e8ef; padding: 0.5rem 0.75rem; text-align: left;">Metric</th>
+                    <th style="border-bottom: 1px solid #e6e8ef; padding: 0.5rem 0.75rem; text-align: left;">Value</th>
+                </tr>
+            </thead>
+            <tbody>{rows}</tbody>
+        </table>
+        </div>
+        <style>
+            table.summary-table td {{
+                border-top: 1px solid #eef0f4;
+                padding: 0.45rem 0.75rem;
+                white-space: nowrap;
+            }}
+            table.summary-table td:first-child {{
+                min-width: 135px;
+            }}
+            table.summary-table td:last-child {{
+                min-width: 70px;
+            }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _apply_inlier_ratio_threshold(
+    alignment_results: list,
+    threshold: float,
+) -> list:
+    """Apply an inlier-ratio threshold to precomputed alignment results."""
+    adjusted_results = []
+    for result in alignment_results:
+        if result.status == "reference":
+            adjusted_results.append(result)
+        elif result.status != "accepted":
+            adjusted_results.append(result)
+        elif result.inlier_ratio >= threshold:
+            adjusted_results.append(result)
+        else:
+            adjusted_results.append(
+                replace(
+                    result,
+                    accepted=False,
+                    reason="low inlier ratio",
+                    status="low inlier ratio",
+                )
+            )
+
+    return adjusted_results
+
+
+def _accepted_count(alignment_results: list) -> int:
+    """Count accepted alignment results."""
+    return sum(1 for result in alignment_results if result.accepted)
+
+
+def _relax_inlier_ratio(
+    alignment_results: list,
+    start_threshold: float,
+    target_accepted_frames: int,
+) -> tuple[float, list]:
+    """Relax inlier ratio until enough frames are accepted or zero is reached."""
+    threshold = start_threshold
+    target = max(1, min(target_accepted_frames, len(alignment_results)))
+
+    while threshold > 0:
+        adjusted_results = _apply_inlier_ratio_threshold(alignment_results, threshold)
+        if _accepted_count(adjusted_results) >= target:
+            return threshold, adjusted_results
+        threshold = max(0.0, round(threshold - INLIER_RATIO_RELAX_STEP, 2))
+
+    adjusted_results = _apply_inlier_ratio_threshold(alignment_results, threshold)
+    return threshold, adjusted_results
 
 
 def main() -> None:
@@ -159,15 +263,15 @@ def main() -> None:
                 "Minimum matches",
                 min_value=3,
                 max_value=500,
-                value=30,
+                value=10,
                 step=1,
             )
             minimum_inlier_ratio = st.slider(
                 "Minimum inlier ratio",
                 min_value=0.0,
                 max_value=1.0,
-                value=0.25,
-                step=0.05,
+                value=1.0,
+                step=0.01,
             )
             ransac_reproj_threshold = st.number_input(
                 "RANSAC reprojection threshold",
@@ -178,7 +282,7 @@ def main() -> None:
             )
 
         st.subheader("Video Metadata")
-        st.dataframe(_metadata_table(summary), hide_index=True, width="content")
+        _render_summary_table(_metadata_table(summary))
 
         with st.spinner("Extracting frames from the selected time window..."):
             frames, extraction_metadata = extract_frames(
@@ -191,11 +295,7 @@ def main() -> None:
             )
 
         st.subheader("Extraction")
-        st.dataframe(
-            _extraction_table(extraction_metadata),
-            hide_index=True,
-            width="content",
-        )
+        _render_summary_table(_extraction_table(extraction_metadata))
 
         first_frame_rgb = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
         st.image(
@@ -227,17 +327,34 @@ def main() -> None:
             max_features=int(max_orb_features),
             keep_matches=int(keep_top_matches),
             min_matches=int(minimum_matches),
-            min_inlier_ratio=float(minimum_inlier_ratio),
+            min_inlier_ratio=0.0,
             ransac_reproj_threshold=float(ransac_reproj_threshold),
         )
 
         with st.spinner("Aligning frames to the selected reference..."):
-            alignment_results = align_frames(frames, reference_index, alignment_settings)
+            raw_alignment_results = align_frames(
+                frames,
+                reference_index,
+                alignment_settings,
+            )
+            applied_inlier_ratio, alignment_results = _relax_inlier_ratio(
+                raw_alignment_results,
+                float(minimum_inlier_ratio),
+                int(minimum_matches),
+            )
             accepted_aligned_frames = accepted_frames(alignment_results)
             averaged_bgr = average_frames(accepted_aligned_frames)
 
         st.subheader("Alignment")
-        st.metric("Accepted frames", f"{len(accepted_aligned_frames)} / {len(frames)}")
+        metric_columns = st.columns(2)
+        metric_columns[0].metric(
+            "Accepted frames",
+            f"{len(accepted_aligned_frames)} / {len(frames)}",
+        )
+        metric_columns[1].metric(
+            "Applied minimum inlier ratio",
+            f"{applied_inlier_ratio:.2f}",
+        )
         st.dataframe(
             alignment_table(alignment_results),
             hide_index=True,
