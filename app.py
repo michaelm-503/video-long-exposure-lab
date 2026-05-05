@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 import cv2
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -20,16 +21,46 @@ from longexposure.frames import (
     select_reference_frame,
 )
 from longexposure.io import get_video_summary, save_uploaded_video_to_temp
-from longexposure.stacking import accepted_frames, average_frames
+from longexposure.stacking import (
+    StackingMode,
+    accepted_frames,
+    crop_unstable_borders,
+    stack_frames,
+)
 
 
 APP_TITLE = "Video Long Exposure Lab"
 INLIER_RATIO_RELAX_STEP = 0.05
+OUTPUT_DIR = Path("outputs")
+STACKING_MODE_LABELS: dict[str, StackingMode] = {
+    "Mean": "mean",
+    "Sigma-clipped mean (cleanup)": "sigma_clipped_mean",
+    "Median (experimental)": "median",
+}
 
 
 def _natural_media_width(width: float | int) -> int:
     """Return a safe pixel width for media displayed at natural size."""
     return max(1, int(width))
+
+
+def _encode_image(image_bgr: np.ndarray, extension: str) -> bytes:
+    """Encode a BGR image for downloads."""
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, 95] if extension == ".jpg" else []
+    ok, encoded = cv2.imencode(extension, image_bgr, encode_params)
+    if not ok:
+        raise ValueError(f"Could not encode image as {extension}")
+    return encoded.tobytes()
+
+
+def _save_output_images(image_bgr: np.ndarray) -> tuple[Path, Path]:
+    """Save PNG and JPEG outputs locally for portfolio/demo runs."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    png_path = OUTPUT_DIR / "long_exposure.png"
+    jpg_path = OUTPUT_DIR / "long_exposure.jpg"
+    cv2.imwrite(str(png_path), image_bgr)
+    cv2.imwrite(str(jpg_path), image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    return png_path, jpg_path
 
 
 def _metadata_table(metadata: dict[str, float | int]) -> pd.DataFrame:
@@ -280,6 +311,21 @@ def main() -> None:
                 value=3.0,
                 step=0.5,
             )
+            st.header("Stacking")
+            stacking_label = st.selectbox(
+                "Stacking mode",
+                options=list(STACKING_MODE_LABELS),
+                index=0,
+            )
+            stacking_mode = STACKING_MODE_LABELS[stacking_label]
+            crop_borders = st.checkbox("Crop borders", value=True)
+            valid_border_threshold = st.slider(
+                "Valid border threshold",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.98,
+                step=0.01,
+            )
 
         st.subheader("Video Metadata")
         _render_summary_table(_metadata_table(summary))
@@ -343,7 +389,13 @@ def main() -> None:
                 int(minimum_matches),
             )
             accepted_aligned_frames = accepted_frames(alignment_results)
-            averaged_bgr = average_frames(accepted_aligned_frames)
+            final_bgr = stack_frames(accepted_aligned_frames, stacking_mode)
+            if crop_borders:
+                final_bgr = crop_unstable_borders(
+                    final_bgr,
+                    alignment_results,
+                    float(valid_border_threshold),
+                )
 
         st.subheader("Alignment")
         metric_columns = st.columns(2)
@@ -361,12 +413,29 @@ def main() -> None:
             width="content",
         )
 
-        averaged_rgb = cv2.cvtColor(averaged_bgr.astype("uint8"), cv2.COLOR_BGR2RGB)
-        st.subheader("Aligned Average")
+        final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
+        _png_path, _jpg_path = _save_output_images(final_bgr)
+        png_bytes = _encode_image(final_bgr, ".png")
+        jpg_bytes = _encode_image(final_bgr, ".jpg")
+
+        st.subheader("Final Output")
         st.image(
-            averaged_rgb,
-            caption="Accepted aligned frames averaged full-frame",
+            final_rgb,
+            caption="Long-exposure still",
             width="content",
+        )
+        download_columns = st.columns(2)
+        download_columns[0].download_button(
+            "Download PNG",
+            data=png_bytes,
+            file_name="long_exposure.png",
+            mime="image/png",
+        )
+        download_columns[1].download_button(
+            "Download JPEG",
+            data=jpg_bytes,
+            file_name="long_exposure.jpg",
+            mime="image/jpeg",
         )
     except ValueError as error:
         st.error(str(error))

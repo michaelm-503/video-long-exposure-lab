@@ -11,7 +11,12 @@ import numpy as np
 from longexposure.alignment import AlignmentResult, AlignmentSettings, align_frames
 from longexposure.diagnostics import DiagnosticsSummary, summarize_alignment
 from longexposure.frames import extract_frames, select_reference_frame
-from longexposure.stacking import accepted_frames, average_frames, crop_unstable_borders
+from longexposure.stacking import (
+    StackingMode,
+    accepted_frames,
+    crop_unstable_borders,
+    stack_frames,
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +29,9 @@ class PipelineConfig:
     start_time_seconds: float = 0.0
     duration_seconds: float = 3.0
     alignment_settings: AlignmentSettings | None = None
+    stacking_mode: StackingMode = "mean"
+    crop_borders: bool = True
+    valid_border_threshold: float = 0.98
 
 
 @dataclass(frozen=True)
@@ -59,13 +67,18 @@ def run_pipeline(video_path: Path, config: PipelineConfig | None = None) -> Pipe
         resolved_config.alignment_settings,
     )
     frames_to_stack = accepted_frames(alignment_results)
-    averaged_bgr = average_frames(frames_to_stack)
-    cropped_bgr = crop_unstable_borders(averaged_bgr)
-    cropped = cv2.cvtColor(cropped_bgr.astype("uint8"), cv2.COLOR_BGR2RGB)
+    stacked_bgr = stack_frames(frames_to_stack, resolved_config.stacking_mode)
+    if resolved_config.crop_borders:
+        stacked_bgr = crop_unstable_borders(
+            stacked_bgr,
+            alignment_results,
+            resolved_config.valid_border_threshold,
+        )
+    stacked_rgb = cv2.cvtColor(stacked_bgr, cv2.COLOR_BGR2RGB)
     diagnostics = summarize_alignment(alignment_results)
 
     return PipelineResult(
-        image=cropped,
+        image=stacked_rgb,
         reference_frame=cv2.cvtColor(reference_bgr, cv2.COLOR_BGR2RGB),
         alignment_results=alignment_results,
         diagnostics=diagnostics,
