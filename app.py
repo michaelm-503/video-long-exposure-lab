@@ -3,18 +3,61 @@
 from __future__ import annotations
 
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
+import cv2
 import pandas as pd
 import streamlit as st
 
-from longexposure.diagnostics import alignment_table
-from longexposure.io import export_image, get_video_summary, save_uploaded_video
-from longexposure.pipeline import PipelineConfig, run_pipeline
+from longexposure.frames import extract_frames
+from longexposure.io import get_video_summary, save_uploaded_video_to_temp
 
 
 APP_TITLE = "Video Long Exposure Lab"
-OUTPUT_DIR = Path("outputs")
+
+
+def _natural_media_width(width: float | int) -> int:
+    """Return a safe pixel width for media displayed at natural size."""
+    return max(1, int(width))
+
+
+def _metadata_table(metadata: dict[str, float | int]) -> pd.DataFrame:
+    """Format video metadata for Streamlit display."""
+    return pd.DataFrame(
+        {
+            "Metric": ["FPS", "Frame count", "Duration seconds", "Width", "Height"],
+            "Value": [
+                round(float(metadata["fps"]), 2),
+                metadata["frame_count"],
+                round(float(metadata["duration_seconds"]), 2),
+                metadata["width"],
+                metadata["height"],
+            ],
+        }
+    )
+
+
+def _extraction_table(metadata: dict[str, float | int]) -> pd.DataFrame:
+    """Format extraction metadata for Streamlit display."""
+    return pd.DataFrame(
+        {
+            "Metric": [
+                "Frames extracted",
+                "Frames read",
+                "Start frame",
+                "Frame stride",
+                "Resize width",
+                "Failed reads",
+            ],
+            "Value": [
+                metadata["frames_extracted"],
+                metadata["frames_read"],
+                metadata["start_frame"],
+                metadata["stride"],
+                metadata["resize_width"],
+                metadata["failed_reads"],
+            ],
+        }
+    )
 
 
 def main() -> None:
@@ -25,88 +68,92 @@ def main() -> None:
 
     uploaded_file = st.file_uploader(
         "Upload a short video",
-        type=["mp4", "mov", "m4v", "avi"],
+        type=["mov", "mp4", "m4v"],
         accept_multiple_files=False,
     )
 
-    with st.sidebar:
-        st.header("Processing")
-        max_frames = st.slider(
-            "Maximum frames",
-            min_value=5,
-            max_value=300,
-            value=120,
-            step=5,
-        )
-        stride = st.number_input(
-            "Frame stride",
-            min_value=1,
-            max_value=60,
-            value=1,
-            step=1,
-        )
-        run_requested = st.button(
-            "Build image",
-            type="primary",
-            disabled=uploaded_file is None,
-        )
-
     if uploaded_file is None:
-        st.info("Upload a short local video to create a still image from averaged frames.")
+        st.info("Upload a short local video to inspect metadata and extracted frames.")
         return
 
-    with NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as temp_file:
-        video_path = save_uploaded_video(uploaded_file.getvalue(), Path(temp_file.name))
+    uploaded_bytes = uploaded_file.getvalue()
 
-    summary = get_video_summary(video_path)
-    st.subheader("Video")
-    st.dataframe(
-        pd.DataFrame(
-            {
-                "Metric": ["Frames", "FPS", "Width", "Height", "Duration seconds"],
-                "Value": [
-                    summary["frame_count"],
-                    round(float(summary["fps"]), 2),
-                    summary["width"],
-                    summary["height"],
-                    round(float(summary["duration_seconds"]), 2),
-                ],
-            }
-        ),
-        hide_index=True,
-        use_container_width=True,
-    )
+    suffix = Path(uploaded_file.name).suffix
+    video_path = save_uploaded_video_to_temp(uploaded_bytes, suffix)
 
-    if not run_requested:
-        st.info("Choose processing settings, then build the image.")
-        return
+    try:
+        summary = get_video_summary(video_path)
+        video_width = int(summary["width"])
+        video_duration = float(summary["duration_seconds"])
+        default_resize_width = round(video_width * 0.95) if video_width > 0 else 0
+        st.video(uploaded_bytes, width=_natural_media_width(video_width))
 
-    config = PipelineConfig(max_frames=max_frames, stride=int(stride))
+        with st.sidebar:
+            st.header("Processing")
+            max_frames = st.slider(
+                "Maximum frames",
+                min_value=5,
+                max_value=300,
+                value=90,
+                step=5,
+            )
+            stride = st.number_input(
+                "Frame stride",
+                min_value=1,
+                max_value=60,
+                value=1,
+                step=1,
+            )
+            resize_width = st.number_input(
+                "Resize width",
+                min_value=1,
+                max_value=max(1, video_width),
+                value=max(1, default_resize_width),
+                step=1,
+            )
+            start_time_seconds = st.number_input(
+                "Start time seconds",
+                min_value=0.0,
+                value=0.0,
+                step=0.5,
+            )
+            process_duration_seconds = st.number_input(
+                "Duration seconds to process",
+                min_value=0.1,
+                value=min(3.0, video_duration) if video_duration > 0 else 3.0,
+                step=0.5,
+            )
 
-    with st.spinner("Extracting, aligning, filtering, averaging, and cropping frames..."):
-        result = run_pipeline(video_path, config)
-        output_path = export_image(result.image, OUTPUT_DIR / "long_exposure.png")
+        st.subheader("Video Metadata")
+        st.dataframe(_metadata_table(summary), hide_index=True, width="stretch")
 
-    st.subheader("Result")
-    st.image(result.image.astype("uint8"), caption="Long-exposure average", use_container_width=True)
+        with st.spinner("Extracting frames from the selected time window..."):
+            frames, extraction_metadata = extract_frames(
+                video_path,
+                max_frames=max_frames,
+                stride=int(stride),
+                resize_width=int(resize_width),
+                start_time_seconds=float(start_time_seconds),
+                duration_seconds=float(process_duration_seconds),
+            )
 
-    with output_path.open("rb") as image_file:
-        st.download_button(
-            "Download PNG",
-            data=image_file,
-            file_name=output_path.name,
-            mime="image/png",
+        st.subheader("Extraction")
+        st.dataframe(
+            _extraction_table(extraction_metadata),
+            hide_index=True,
+            width="stretch",
         )
 
-    diagnostics = result.diagnostics
-    metric_columns = st.columns(4)
-    metric_columns[0].metric("Frames", diagnostics.total_frames)
-    metric_columns[1].metric("Accepted", diagnostics.accepted_frames)
-    metric_columns[2].metric("Rejected", diagnostics.rejected_frames)
-    metric_columns[3].metric("Avg score", f"{diagnostics.average_score:.2f}")
-
-    with st.expander("Frame diagnostics"):
-        st.dataframe(alignment_table(result.alignment_results), use_container_width=True)
+        first_frame_rgb = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
+        st.image(
+            first_frame_rgb,
+            caption="First extracted frame",
+            width="content",
+        )
+    except ValueError as error:
+        st.error(str(error))
+    finally:
+        video_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

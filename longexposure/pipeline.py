@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from longexposure.alignment import AlignmentResult, align_frames
@@ -17,8 +18,11 @@ from longexposure.stacking import accepted_frames, average_frames, crop_unstable
 class PipelineConfig:
     """Configurable limits for a local processing run."""
 
-    max_frames: int = 120
+    max_frames: int = 90
     stride: int = 1
+    resize_width: int | None = None
+    start_time_seconds: float = 0.0
+    duration_seconds: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -39,11 +43,15 @@ def run_pipeline(video_path: Path, config: PipelineConfig | None = None) -> Pipe
     average mode while the registration logic is still being built.
     """
     resolved_config = config or PipelineConfig()
-    frames = extract_frames(
+    frames_bgr, _metadata = extract_frames(
         video_path,
         max_frames=resolved_config.max_frames,
         stride=resolved_config.stride,
+        resize_width=resolved_config.resize_width,
+        start_time_seconds=resolved_config.start_time_seconds,
+        duration_seconds=resolved_config.duration_seconds,
     )
+    frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frames_bgr]
     reference = choose_reference_frame(frames)
     alignment_results = align_frames(frames, reference)
     frames_to_stack = accepted_frames(alignment_results)
@@ -57,4 +65,3 @@ def run_pipeline(video_path: Path, config: PipelineConfig | None = None) -> Pipe
         alignment_results=alignment_results,
         diagnostics=diagnostics,
     )
-
