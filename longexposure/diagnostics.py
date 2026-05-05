@@ -51,10 +51,12 @@ def alignment_table(results: list[AlignmentResult]) -> pd.DataFrame:
     """Build a tabular view of frame-level alignment diagnostics."""
     rows = [
         {
-            "frame": index,
-            "accepted": result.accepted,
-            "score": result.score,
-            "reason": result.reason,
+            "frame index": index,
+            "accepted/rejected": "accepted" if result.accepted else "rejected",
+            "matches": result.matches,
+            "inliers": result.inliers,
+            "inlier_ratio": round(result.inlier_ratio, 3),
+            "status": result.status or result.reason,
         }
         for index, result in enumerate(results)
     ]

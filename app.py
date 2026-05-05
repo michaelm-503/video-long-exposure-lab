@@ -9,7 +9,8 @@ import cv2
 import pandas as pd
 import streamlit as st
 
-from longexposure.diagnostics import sharpness_figure
+from longexposure.alignment import AlignmentSettings, align_frames
+from longexposure.diagnostics import alignment_table, sharpness_figure
 from longexposure.frames import (
     ReferenceStrategy,
     extract_frames,
@@ -17,6 +18,7 @@ from longexposure.frames import (
     select_reference_frame,
 )
 from longexposure.io import get_video_summary, save_uploaded_video_to_temp
+from longexposure.stacking import accepted_frames, average_frames
 
 
 APP_TITLE = "Video Long Exposure Lab"
@@ -134,9 +136,45 @@ def main() -> None:
                 ReferenceStrategy,
                 st.selectbox(
                     "Reference strategy",
-                    options=["sharpest", "middle", "first"],
+                    options=["median", "sharpest", "middle", "first"],
                     index=0,
                 ),
+            )
+            st.header("Alignment")
+            max_orb_features = st.number_input(
+                "Max ORB features",
+                min_value=100,
+                max_value=5000,
+                value=1500,
+                step=100,
+            )
+            keep_top_matches = st.number_input(
+                "Keep top matches",
+                min_value=10,
+                max_value=1000,
+                value=200,
+                step=10,
+            )
+            minimum_matches = st.number_input(
+                "Minimum matches",
+                min_value=3,
+                max_value=500,
+                value=30,
+                step=1,
+            )
+            minimum_inlier_ratio = st.slider(
+                "Minimum inlier ratio",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.25,
+                step=0.05,
+            )
+            ransac_reproj_threshold = st.number_input(
+                "RANSAC reprojection threshold",
+                min_value=0.5,
+                max_value=20.0,
+                value=3.0,
+                step=0.5,
             )
 
         st.subheader("Video Metadata")
@@ -182,6 +220,35 @@ def main() -> None:
         )
         st.pyplot(
             sharpness_figure(sharpness_scores, reference_index),
+            width="content",
+        )
+
+        alignment_settings = AlignmentSettings(
+            max_features=int(max_orb_features),
+            keep_matches=int(keep_top_matches),
+            min_matches=int(minimum_matches),
+            min_inlier_ratio=float(minimum_inlier_ratio),
+            ransac_reproj_threshold=float(ransac_reproj_threshold),
+        )
+
+        with st.spinner("Aligning frames to the selected reference..."):
+            alignment_results = align_frames(frames, reference_index, alignment_settings)
+            accepted_aligned_frames = accepted_frames(alignment_results)
+            averaged_bgr = average_frames(accepted_aligned_frames)
+
+        st.subheader("Alignment")
+        st.metric("Accepted frames", f"{len(accepted_aligned_frames)} / {len(frames)}")
+        st.dataframe(
+            alignment_table(alignment_results),
+            hide_index=True,
+            width="content",
+        )
+
+        averaged_rgb = cv2.cvtColor(averaged_bgr.astype("uint8"), cv2.COLOR_BGR2RGB)
+        st.subheader("Aligned Average")
+        st.image(
+            averaged_rgb,
+            caption="Accepted aligned frames averaged full-frame",
             width="content",
         )
     except ValueError as error:

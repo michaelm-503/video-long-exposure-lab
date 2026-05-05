@@ -11,7 +11,7 @@ import numpy as np
 from longexposure.io import VideoMetadata, get_video_summary
 
 MAX_DEMO_FRAMES = 300
-ReferenceStrategy = Literal["sharpest", "middle", "first"]
+ReferenceStrategy = Literal["median", "sharpest", "middle", "first"]
 
 
 def _resize_frame(frame: np.ndarray, resize_width: int | None) -> np.ndarray:
@@ -129,13 +129,21 @@ def score_frames_sharpness(frames: list[np.ndarray]) -> list[float]:
 
 def select_reference_frame(
     frames: list[np.ndarray],
-    strategy: ReferenceStrategy = "sharpest",
+    strategy: ReferenceStrategy = "median",
 ) -> tuple[int, np.ndarray]:
-    """Select a reference frame by sharpness, middle index, or first index."""
+    """Select a reference frame by median sharpness, sharpness, middle, or first."""
     if not frames:
         raise ValueError("At least one frame is required")
 
-    if strategy == "sharpest":
+    if strategy == "median":
+        scores = score_frames_sharpness(frames)
+        median_score = float(np.median(scores))
+        middle_index = len(frames) // 2
+        reference_index = min(
+            range(len(scores)),
+            key=lambda index: (abs(scores[index] - median_score), abs(index - middle_index)),
+        )
+    elif strategy == "sharpest":
         scores = score_frames_sharpness(frames)
         reference_index = int(np.argmax(scores))
     elif strategy == "middle":
@@ -143,14 +151,14 @@ def select_reference_frame(
     elif strategy == "first":
         reference_index = 0
     else:
-        supported = ", ".join(["sharpest", "middle", "first"])
+        supported = ", ".join(["median", "sharpest", "middle", "first"])
         raise ValueError(f"Unsupported reference strategy: {strategy}. Use {supported}.")
 
     return reference_index, frames[reference_index]
 
 
 def choose_reference_frame(frames: Iterable[np.ndarray]) -> np.ndarray:
-    """Choose the sharpest reference frame for alignment."""
+    """Choose a median-sharpness reference frame for alignment."""
     frame_list = list(frames)
-    _reference_index, reference_frame = select_reference_frame(frame_list, "sharpest")
+    _reference_index, reference_frame = select_reference_frame(frame_list, "median")
     return reference_frame

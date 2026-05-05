@@ -8,9 +8,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from longexposure.alignment import AlignmentResult, align_frames
+from longexposure.alignment import AlignmentResult, AlignmentSettings, align_frames
 from longexposure.diagnostics import DiagnosticsSummary, summarize_alignment
-from longexposure.frames import choose_reference_frame, extract_frames
+from longexposure.frames import extract_frames, select_reference_frame
 from longexposure.stacking import accepted_frames, average_frames, crop_unstable_borders
 
 
@@ -23,6 +23,7 @@ class PipelineConfig:
     resize_width: int | None = None
     start_time_seconds: float = 0.0
     duration_seconds: float = 3.0
+    alignment_settings: AlignmentSettings | None = None
 
 
 @dataclass(frozen=True)
@@ -51,17 +52,21 @@ def run_pipeline(video_path: Path, config: PipelineConfig | None = None) -> Pipe
         start_time_seconds=resolved_config.start_time_seconds,
         duration_seconds=resolved_config.duration_seconds,
     )
-    frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frames_bgr]
-    reference = choose_reference_frame(frames)
-    alignment_results = align_frames(frames, reference)
+    reference_index, reference_bgr = select_reference_frame(frames_bgr, "median")
+    alignment_results = align_frames(
+        frames_bgr,
+        reference_index,
+        resolved_config.alignment_settings,
+    )
     frames_to_stack = accepted_frames(alignment_results)
-    averaged = average_frames(frames_to_stack)
-    cropped = crop_unstable_borders(averaged)
+    averaged_bgr = average_frames(frames_to_stack)
+    cropped_bgr = crop_unstable_borders(averaged_bgr)
+    cropped = cv2.cvtColor(cropped_bgr.astype("uint8"), cv2.COLOR_BGR2RGB)
     diagnostics = summarize_alignment(alignment_results)
 
     return PipelineResult(
         image=cropped,
-        reference_frame=reference,
+        reference_frame=cv2.cvtColor(reference_bgr, cv2.COLOR_BGR2RGB),
         alignment_results=alignment_results,
         diagnostics=diagnostics,
     )
