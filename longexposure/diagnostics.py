@@ -3,7 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+from pathlib import Path
+import tempfile
 
+os.environ.setdefault(
+    "MPLCONFIGDIR",
+    str(Path(tempfile.gettempdir()) / "video-long-exposure-lab-matplotlib"),
+)
+
+from matplotlib.figure import Figure
 import pandas as pd
 
 from longexposure.alignment import AlignmentResult
@@ -51,3 +60,30 @@ def alignment_table(results: list[AlignmentResult]) -> pd.DataFrame:
     ]
     return pd.DataFrame(rows)
 
+
+def sharpness_figure(scores: list[float], reference_index: int) -> Figure:
+    """Build a simple sharpness plot with the selected reference frame marked."""
+    figure = Figure(figsize=(8, 3.5), layout="constrained")
+    axis = figure.subplots()
+    frame_numbers = list(range(len(scores)))
+
+    axis.plot(frame_numbers, scores, color="#2f6fed", linewidth=1.8)
+    axis.scatter(frame_numbers, scores, color="#2f6fed", s=18)
+
+    if scores:
+        axis.scatter(
+            [reference_index],
+            [scores[reference_index]],
+            color="#d44f24",
+            s=48,
+            zorder=3,
+            label=f"Reference frame {reference_index}",
+        )
+        axis.legend(loc="best")
+
+    axis.set_title("Frame sharpness")
+    axis.set_xlabel("Extracted frame index")
+    axis.set_ylabel("Laplacian variance")
+    axis.grid(True, alpha=0.25)
+
+    return figure

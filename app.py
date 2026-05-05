@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import cv2
 import pandas as pd
 import streamlit as st
 
-from longexposure.frames import extract_frames
+from longexposure.diagnostics import sharpness_figure
+from longexposure.frames import (
+    ReferenceStrategy,
+    extract_frames,
+    score_frames_sharpness,
+    select_reference_frame,
+)
 from longexposure.io import get_video_summary, save_uploaded_video_to_temp
 
 
@@ -123,9 +130,17 @@ def main() -> None:
                 value=min(3.0, video_duration) if video_duration > 0 else 3.0,
                 step=0.5,
             )
+            reference_strategy = cast(
+                ReferenceStrategy,
+                st.selectbox(
+                    "Reference strategy",
+                    options=["sharpest", "middle", "first"],
+                    index=0,
+                ),
+            )
 
         st.subheader("Video Metadata")
-        st.dataframe(_metadata_table(summary), hide_index=True, width="stretch")
+        st.dataframe(_metadata_table(summary), hide_index=True, width="content")
 
         with st.spinner("Extracting frames from the selected time window..."):
             frames, extraction_metadata = extract_frames(
@@ -141,13 +156,32 @@ def main() -> None:
         st.dataframe(
             _extraction_table(extraction_metadata),
             hide_index=True,
-            width="stretch",
+            width="content",
         )
 
         first_frame_rgb = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
         st.image(
             first_frame_rgb,
             caption="First extracted frame",
+            width="content",
+        )
+
+        sharpness_scores = score_frames_sharpness(frames)
+        reference_index, reference_frame = select_reference_frame(
+            frames,
+            reference_strategy,
+        )
+        reference_frame_rgb = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2RGB)
+
+        st.subheader("Reference Frame")
+        st.metric("Selected reference index", reference_index)
+        st.image(
+            reference_frame_rgb,
+            caption=f"Reference frame ({reference_strategy})",
+            width="content",
+        )
+        st.pyplot(
+            sharpness_figure(sharpness_scores, reference_index),
             width="content",
         )
     except ValueError as error:

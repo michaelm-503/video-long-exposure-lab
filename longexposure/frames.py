@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Literal
 
 import cv2
 import numpy as np
@@ -11,6 +11,7 @@ import numpy as np
 from longexposure.io import VideoMetadata, get_video_summary
 
 MAX_DEMO_FRAMES = 300
+ReferenceStrategy = Literal["sharpest", "middle", "first"]
 
 
 def _resize_frame(frame: np.ndarray, resize_width: int | None) -> np.ndarray:
@@ -112,13 +113,44 @@ def extract_frames(
     return frames, extraction_metadata
 
 
-def choose_reference_frame(frames: Iterable[np.ndarray]) -> np.ndarray:
-    """Choose a reference frame for alignment.
+def laplacian_sharpness(frame_bgr: np.ndarray) -> float:
+    """Score frame sharpness with the variance of the grayscale Laplacian."""
+    if frame_bgr.size == 0:
+        raise ValueError("frame_bgr must not be empty")
 
-    TODO: Replace this first-frame placeholder with a sharper, more deliberate
-    reference selection strategy.
-    """
-    frame_list = list(frames)
-    if not frame_list:
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def score_frames_sharpness(frames: list[np.ndarray]) -> list[float]:
+    """Return Laplacian sharpness scores for extracted BGR frames."""
+    return [laplacian_sharpness(frame) for frame in frames]
+
+
+def select_reference_frame(
+    frames: list[np.ndarray],
+    strategy: ReferenceStrategy = "sharpest",
+) -> tuple[int, np.ndarray]:
+    """Select a reference frame by sharpness, middle index, or first index."""
+    if not frames:
         raise ValueError("At least one frame is required")
-    return frame_list[0]
+
+    if strategy == "sharpest":
+        scores = score_frames_sharpness(frames)
+        reference_index = int(np.argmax(scores))
+    elif strategy == "middle":
+        reference_index = len(frames) // 2
+    elif strategy == "first":
+        reference_index = 0
+    else:
+        supported = ", ".join(["sharpest", "middle", "first"])
+        raise ValueError(f"Unsupported reference strategy: {strategy}. Use {supported}.")
+
+    return reference_index, frames[reference_index]
+
+
+def choose_reference_frame(frames: Iterable[np.ndarray]) -> np.ndarray:
+    """Choose the sharpest reference frame for alignment."""
+    frame_list = list(frames)
+    _reference_index, reference_frame = select_reference_frame(frame_list, "sharpest")
+    return reference_frame
