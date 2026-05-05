@@ -64,12 +64,13 @@ def sigma_clipped_mean_stack(
 def stack_frames(
     frames_bgr: list[np.ndarray],
     mode: StackingMode = "mean",
+    sigma: float = 2.5,
 ) -> np.ndarray:
     """Stack BGR frames with the selected stacking mode."""
     if mode == "mean":
         return mean_stack(frames_bgr)
     if mode == "sigma_clipped_mean":
-        return sigma_clipped_mean_stack(frames_bgr)
+        return sigma_clipped_mean_stack(frames_bgr, sigma)
     if mode == "median":
         return median_stack(frames_bgr)
 

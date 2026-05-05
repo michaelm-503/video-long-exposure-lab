@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from html import escape
 from pathlib import Path
 from typing import cast
@@ -12,25 +11,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from longexposure.alignment import AlignmentSettings, align_frames
-from longexposure.diagnostics import alignment_table, sharpness_figure
-from longexposure.frames import (
-    ReferenceStrategy,
-    extract_frames,
-    score_frames_sharpness,
-    select_reference_frame,
-)
+from longexposure.diagnostics import sharpness_figure
+from longexposure.frames import ReferenceStrategy
 from longexposure.io import get_video_summary, save_uploaded_video_to_temp
-from longexposure.stacking import (
-    StackingMode,
-    accepted_frames,
-    crop_unstable_borders,
-    stack_frames,
-)
+from longexposure.pipeline import PipelineResult, PipelineSettings, run_pipeline
+from longexposure.stacking import StackingMode
 
 
 APP_TITLE = "Video Long Exposure Lab"
-INLIER_RATIO_RELAX_STEP = 0.05
 OUTPUT_DIR = Path("outputs")
 STACKING_MODE_LABELS: dict[str, StackingMode] = {
     "Mean": "mean",
@@ -63,8 +51,14 @@ def _save_output_images(image_bgr: np.ndarray) -> tuple[Path, Path]:
     return png_path, jpg_path
 
 
+@st.cache_data(show_spinner=False)
+def _cached_video_summary(video_path: str) -> dict[str, float | int]:
+    """Return cached video metadata for a local temporary file path."""
+    return get_video_summary(Path(video_path))
+
+
 def _metadata_table(metadata: dict[str, float | int]) -> pd.DataFrame:
-    """Format video metadata for Streamlit display."""
+    """Format video metadata for display."""
     return pd.DataFrame(
         {
             "Metric": ["FPS", "Frame count", "Duration seconds", "Width", "Height"],
@@ -74,30 +68,6 @@ def _metadata_table(metadata: dict[str, float | int]) -> pd.DataFrame:
                 round(float(metadata["duration_seconds"]), 2),
                 metadata["width"],
                 metadata["height"],
-            ],
-        }
-    )
-
-
-def _extraction_table(metadata: dict[str, float | int]) -> pd.DataFrame:
-    """Format extraction metadata for Streamlit display."""
-    return pd.DataFrame(
-        {
-            "Metric": [
-                "Frames extracted",
-                "Frames read",
-                "Start frame",
-                "Frame stride",
-                "Resize width",
-                "Failed reads",
-            ],
-            "Value": [
-                metadata["frames_extracted"],
-                metadata["frames_read"],
-                metadata["start_frame"],
-                metadata["stride"],
-                metadata["resize_width"],
-                metadata["failed_reads"],
             ],
         }
     )
@@ -154,54 +124,205 @@ def _render_summary_table(table: pd.DataFrame) -> None:
     )
 
 
-def _apply_inlier_ratio_threshold(
-    alignment_results: list,
-    threshold: float,
-) -> list:
-    """Apply an inlier-ratio threshold to precomputed alignment results."""
-    adjusted_results = []
-    for result in alignment_results:
-        if result.status == "reference":
-            adjusted_results.append(result)
-        elif result.status != "accepted":
-            adjusted_results.append(result)
-        elif result.inlier_ratio >= threshold:
-            adjusted_results.append(result)
-        else:
-            adjusted_results.append(
-                replace(
-                    result,
-                    accepted=False,
-                    reason="low inlier ratio",
-                    status="low inlier ratio",
-                )
-            )
+def _settings_from_sidebar(
+    *,
+    video_width: int,
+    video_duration: float,
+) -> PipelineSettings:
+    """Collect Streamlit sidebar controls into pipeline settings."""
+    default_resize_width = round(video_width * 0.95) if video_width > 0 else 1
 
-    return adjusted_results
+    with st.sidebar:
+        st.header("Processing")
+        max_frames = st.slider(
+            "Maximum frames",
+            min_value=5,
+            max_value=300,
+            value=90,
+            step=5,
+        )
+        frame_stride = st.number_input(
+            "Frame stride",
+            min_value=1,
+            max_value=60,
+            value=1,
+            step=1,
+        )
+        resize_width = st.number_input(
+            "Resize width",
+            min_value=1,
+            max_value=max(1, video_width),
+            value=max(1, default_resize_width),
+            step=1,
+        )
+        start_time_s = st.number_input(
+            "Start time seconds",
+            min_value=0.0,
+            value=0.0,
+            step=0.5,
+        )
+        duration_s = st.number_input(
+            "Duration seconds to process",
+            min_value=0.1,
+            value=min(3.0, video_duration) if video_duration > 0 else 3.0,
+            step=0.5,
+        )
+        reference_strategy = cast(
+            ReferenceStrategy,
+            st.selectbox(
+                "Reference strategy",
+                options=["median", "sharpest", "middle", "first"],
+                index=0,
+            ),
+        )
+
+        st.header("Alignment")
+        orb_max_features = st.number_input(
+            "Max ORB features",
+            min_value=100,
+            max_value=5000,
+            value=1500,
+            step=100,
+        )
+        orb_keep_matches = st.number_input(
+            "Keep top matches",
+            min_value=10,
+            max_value=1000,
+            value=200,
+            step=10,
+        )
+        min_matches = st.number_input(
+            "Minimum matches",
+            min_value=3,
+            max_value=500,
+            value=10,
+            step=1,
+        )
+        min_inlier_ratio = st.slider(
+            "Minimum inlier ratio",
+            min_value=0.0,
+            max_value=1.0,
+            value=1.0,
+            step=0.01,
+        )
+        ransac_reproj_threshold = st.number_input(
+            "RANSAC reprojection threshold",
+            min_value=0.5,
+            max_value=20.0,
+            value=3.0,
+            step=0.5,
+        )
+
+        st.header("Stacking")
+        stacking_label = st.selectbox(
+            "Stacking mode",
+            options=list(STACKING_MODE_LABELS),
+            index=0,
+        )
+        stack_mode = STACKING_MODE_LABELS[stacking_label]
+        sigma = st.number_input(
+            "Sigma clipping",
+            min_value=0.5,
+            max_value=10.0,
+            value=2.5,
+            step=0.1,
+        )
+        crop_borders = st.checkbox("Crop borders", value=True)
+        valid_border_threshold = st.slider(
+            "Valid border threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.98,
+            step=0.01,
+        )
+
+    return PipelineSettings(
+        start_time_s=float(start_time_s),
+        duration_s=float(duration_s),
+        max_frames=int(max_frames),
+        frame_stride=int(frame_stride),
+        resize_width=int(resize_width),
+        reference_strategy=reference_strategy,
+        orb_max_features=int(orb_max_features),
+        orb_keep_matches=int(orb_keep_matches),
+        min_matches=int(min_matches),
+        min_inlier_ratio=float(min_inlier_ratio),
+        ransac_reproj_threshold=float(ransac_reproj_threshold),
+        stack_mode=stack_mode,
+        sigma=float(sigma),
+        crop_borders=bool(crop_borders),
+        valid_border_threshold=float(valid_border_threshold),
+    )
 
 
-def _accepted_count(alignment_results: list) -> int:
-    """Count accepted alignment results."""
-    return sum(1 for result in alignment_results if result.accepted)
+def _render_pipeline_result(result: PipelineResult) -> None:
+    """Render pipeline output and diagnostics."""
+    st.subheader("Extraction")
+    _render_summary_table(
+        pd.DataFrame({"Metric": ["Frames processed"], "Value": [result.frames_processed]})
+    )
 
+    if result.first_frame_bgr is not None:
+        first_frame_rgb = cv2.cvtColor(result.first_frame_bgr, cv2.COLOR_BGR2RGB)
+        st.image(first_frame_rgb, caption="First extracted frame", width="content")
 
-def _relax_inlier_ratio(
-    alignment_results: list,
-    start_threshold: float,
-    target_accepted_frames: int,
-) -> tuple[float, list]:
-    """Relax inlier ratio until enough frames are accepted or zero is reached."""
-    threshold = start_threshold
-    target = max(1, min(target_accepted_frames, len(alignment_results)))
+    st.subheader("Reference Frame")
+    st.metric("Selected reference index", result.reference_index)
+    if result.reference_frame_bgr is not None:
+        reference_frame_rgb = cv2.cvtColor(
+            result.reference_frame_bgr,
+            cv2.COLOR_BGR2RGB,
+        )
+        st.image(reference_frame_rgb, caption="Reference frame", width="content")
+    st.pyplot(
+        sharpness_figure(result.sharpness_scores, result.reference_index),
+        width="content",
+    )
 
-    while threshold > 0:
-        adjusted_results = _apply_inlier_ratio_threshold(alignment_results, threshold)
-        if _accepted_count(adjusted_results) >= target:
-            return threshold, adjusted_results
-        threshold = max(0.0, round(threshold - INLIER_RATIO_RELAX_STEP, 2))
+    st.subheader("Alignment")
+    metric_columns = st.columns(3)
+    metric_columns[0].metric("Accepted frames", result.accepted_count)
+    metric_columns[1].metric("Rejected frames", result.rejected_count)
+    metric_columns[2].metric(
+        "Applied minimum inlier ratio",
+        f"{result.applied_min_inlier_ratio:.2f}",
+    )
+    st.dataframe(
+        pd.DataFrame(result.alignment_diagnostics),
+        hide_index=True,
+        width="content",
+    )
 
-    adjusted_results = _apply_inlier_ratio_threshold(alignment_results, threshold)
-    return threshold, adjusted_results
+    for warning in result.warnings:
+        st.warning(warning)
+
+    final_bgr = (
+        result.cropped_output_image_bgr
+        if result.cropped_output_image_bgr is not None
+        else result.output_image_bgr
+    )
+    final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
+    _save_output_images(final_bgr)
+    png_bytes = _encode_image(final_bgr, ".png")
+    jpg_bytes = _encode_image(final_bgr, ".jpg")
+
+    st.subheader("Final Output")
+    st.image(final_rgb, caption="Long-exposure still", width="content")
+    download_columns = st.columns(2)
+    download_columns[0].download_button(
+        "Download PNG",
+        data=png_bytes,
+        file_name="long_exposure.png",
+        mime="image/png",
+        on_click="ignore",
+    )
+    download_columns[1].download_button(
+        "Download JPEG",
+        data=jpg_bytes,
+        file_name="long_exposure.jpg",
+        mime="image/jpeg",
+        on_click="ignore",
+    )
 
 
 def main() -> None:
@@ -221,222 +342,35 @@ def main() -> None:
         return
 
     uploaded_bytes = uploaded_file.getvalue()
-
     suffix = Path(uploaded_file.name).suffix
     video_path = save_uploaded_video_to_temp(uploaded_bytes, suffix)
 
     try:
-        summary = get_video_summary(video_path)
+        summary = _cached_video_summary(str(video_path))
         video_width = int(summary["width"])
         video_duration = float(summary["duration_seconds"])
-        default_resize_width = round(video_width * 0.95) if video_width > 0 else 0
         st.video(uploaded_bytes, width=_natural_media_width(video_width))
 
-        with st.sidebar:
-            st.header("Processing")
-            max_frames = st.slider(
-                "Maximum frames",
-                min_value=5,
-                max_value=300,
-                value=90,
-                step=5,
-            )
-            stride = st.number_input(
-                "Frame stride",
-                min_value=1,
-                max_value=60,
-                value=1,
-                step=1,
-            )
-            resize_width = st.number_input(
-                "Resize width",
-                min_value=1,
-                max_value=max(1, video_width),
-                value=max(1, default_resize_width),
-                step=1,
-            )
-            start_time_seconds = st.number_input(
-                "Start time seconds",
-                min_value=0.0,
-                value=0.0,
-                step=0.5,
-            )
-            process_duration_seconds = st.number_input(
-                "Duration seconds to process",
-                min_value=0.1,
-                value=min(3.0, video_duration) if video_duration > 0 else 3.0,
-                step=0.5,
-            )
-            reference_strategy = cast(
-                ReferenceStrategy,
-                st.selectbox(
-                    "Reference strategy",
-                    options=["median", "sharpest", "middle", "first"],
-                    index=0,
-                ),
-            )
-            st.header("Alignment")
-            max_orb_features = st.number_input(
-                "Max ORB features",
-                min_value=100,
-                max_value=5000,
-                value=1500,
-                step=100,
-            )
-            keep_top_matches = st.number_input(
-                "Keep top matches",
-                min_value=10,
-                max_value=1000,
-                value=200,
-                step=10,
-            )
-            minimum_matches = st.number_input(
-                "Minimum matches",
-                min_value=3,
-                max_value=500,
-                value=10,
-                step=1,
-            )
-            minimum_inlier_ratio = st.slider(
-                "Minimum inlier ratio",
-                min_value=0.0,
-                max_value=1.0,
-                value=1.0,
-                step=0.01,
-            )
-            ransac_reproj_threshold = st.number_input(
-                "RANSAC reprojection threshold",
-                min_value=0.5,
-                max_value=20.0,
-                value=3.0,
-                step=0.5,
-            )
-            st.header("Stacking")
-            stacking_label = st.selectbox(
-                "Stacking mode",
-                options=list(STACKING_MODE_LABELS),
-                index=0,
-            )
-            stacking_mode = STACKING_MODE_LABELS[stacking_label]
-            crop_borders = st.checkbox("Crop borders", value=True)
-            valid_border_threshold = st.slider(
-                "Valid border threshold",
-                min_value=0.0,
-                max_value=1.0,
-                value=0.98,
-                step=0.01,
-            )
+        settings = _settings_from_sidebar(
+            video_width=video_width,
+            video_duration=video_duration,
+        )
 
         st.subheader("Video Metadata")
         _render_summary_table(_metadata_table(summary))
 
-        with st.spinner("Extracting frames from the selected time window..."):
-            frames, extraction_metadata = extract_frames(
-                video_path,
-                max_frames=max_frames,
-                stride=int(stride),
-                resize_width=int(resize_width),
-                start_time_seconds=float(start_time_seconds),
-                duration_seconds=float(process_duration_seconds),
-            )
+        if not st.button("Run pipeline", type="primary"):
+            st.info("Adjust settings, then run the pipeline to produce the final image.")
+            return
 
-        st.subheader("Extraction")
-        _render_summary_table(_extraction_table(extraction_metadata))
+        with st.status("Processing video", expanded=True) as status:
+            st.write("Extracting frames and scoring sharpness.")
+            st.write("Selecting a reference frame and aligning accepted frames.")
+            st.write("Stacking frames and cropping unstable borders.")
+            result = run_pipeline(video_path, settings)
+            status.update(label="Processing complete", state="complete")
 
-        first_frame_rgb = cv2.cvtColor(frames[0], cv2.COLOR_BGR2RGB)
-        st.image(
-            first_frame_rgb,
-            caption="First extracted frame",
-            width="content",
-        )
-
-        sharpness_scores = score_frames_sharpness(frames)
-        reference_index, reference_frame = select_reference_frame(
-            frames,
-            reference_strategy,
-        )
-        reference_frame_rgb = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2RGB)
-
-        st.subheader("Reference Frame")
-        st.metric("Selected reference index", reference_index)
-        st.image(
-            reference_frame_rgb,
-            caption=f"Reference frame ({reference_strategy})",
-            width="content",
-        )
-        st.pyplot(
-            sharpness_figure(sharpness_scores, reference_index),
-            width="content",
-        )
-
-        alignment_settings = AlignmentSettings(
-            max_features=int(max_orb_features),
-            keep_matches=int(keep_top_matches),
-            min_matches=int(minimum_matches),
-            min_inlier_ratio=0.0,
-            ransac_reproj_threshold=float(ransac_reproj_threshold),
-        )
-
-        with st.spinner("Aligning frames to the selected reference..."):
-            raw_alignment_results = align_frames(
-                frames,
-                reference_index,
-                alignment_settings,
-            )
-            applied_inlier_ratio, alignment_results = _relax_inlier_ratio(
-                raw_alignment_results,
-                float(minimum_inlier_ratio),
-                int(minimum_matches),
-            )
-            accepted_aligned_frames = accepted_frames(alignment_results)
-            final_bgr = stack_frames(accepted_aligned_frames, stacking_mode)
-            if crop_borders:
-                final_bgr = crop_unstable_borders(
-                    final_bgr,
-                    alignment_results,
-                    float(valid_border_threshold),
-                )
-
-        st.subheader("Alignment")
-        metric_columns = st.columns(2)
-        metric_columns[0].metric(
-            "Accepted frames",
-            f"{len(accepted_aligned_frames)} / {len(frames)}",
-        )
-        metric_columns[1].metric(
-            "Applied minimum inlier ratio",
-            f"{applied_inlier_ratio:.2f}",
-        )
-        st.dataframe(
-            alignment_table(alignment_results),
-            hide_index=True,
-            width="content",
-        )
-
-        final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
-        _png_path, _jpg_path = _save_output_images(final_bgr)
-        png_bytes = _encode_image(final_bgr, ".png")
-        jpg_bytes = _encode_image(final_bgr, ".jpg")
-
-        st.subheader("Final Output")
-        st.image(
-            final_rgb,
-            caption="Long-exposure still",
-            width="content",
-        )
-        download_columns = st.columns(2)
-        download_columns[0].download_button(
-            "Download PNG",
-            data=png_bytes,
-            file_name="long_exposure.png",
-            mime="image/png",
-        )
-        download_columns[1].download_button(
-            "Download JPEG",
-            data=jpg_bytes,
-            file_name="long_exposure.jpg",
-            mime="image/jpeg",
-        )
+        _render_pipeline_result(result)
     except ValueError as error:
         st.error(str(error))
     finally:
