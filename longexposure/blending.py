@@ -6,15 +6,37 @@ import cv2
 import numpy as np
 
 
+def _empty_mask(output_size: tuple[int, int]) -> np.ndarray:
+    """Return a zero alpha mask for a height, width output size."""
+    height, width = output_size
+    return np.zeros((height, width), dtype=np.float32)
+
+
+def _canvas_has_drawn_objects(canvas_result) -> bool | None:
+    """Return whether drawable-canvas JSON contains user-drawn objects."""
+    json_data = getattr(canvas_result, "json_data", None)
+    if not isinstance(json_data, dict):
+        return None
+
+    objects = json_data.get("objects")
+    if objects is None:
+        return None
+
+    return bool(objects)
+
+
 def extract_paint_mask_from_canvas(
     canvas_result,
     background_rgb_display: np.ndarray | None,
     output_size: tuple[int, int],
 ) -> np.ndarray:
     """Extract a painted alpha mask from a drawable-canvas result."""
+    has_drawn_objects = _canvas_has_drawn_objects(canvas_result)
+    if has_drawn_objects is False:
+        return _empty_mask(output_size)
+
     if canvas_result.image_data is None:
-        height, width = output_size
-        return np.zeros((height, width), dtype=np.float32)
+        return _empty_mask(output_size)
 
     canvas_rgba = np.asarray(canvas_result.image_data).astype(np.uint8)
     canvas_rgb = canvas_rgba[:, :, :3]
