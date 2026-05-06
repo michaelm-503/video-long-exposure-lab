@@ -199,25 +199,86 @@ def _resolve_inlier_ratio_threshold(
     )
 
 
+def _max_transform_movement_px(
+    alignment_results: list[AlignmentResult],
+    frame_shape: tuple[int, int],
+) -> float:
+    """Estimate the largest accepted-frame corner movement in pixels."""
+    height, width = frame_shape
+    corners = np.array(
+        [
+            [0.0, 0.0, 1.0],
+            [float(width), 0.0, 1.0],
+            [0.0, float(height), 1.0],
+            [float(width), float(height), 1.0],
+        ],
+        dtype=np.float32,
+    )
+    max_movement = 0.0
+
+    for result in alignment_results:
+        if not result.accepted or result.matrix is None or result.status == "reference":
+            continue
+
+        transformed = corners @ result.matrix.T
+        movement = np.linalg.norm(transformed - corners[:, :2], axis=1)
+        max_movement = max(max_movement, float(np.max(movement)))
+
+    return max_movement
+
+
 def _result_warnings(
     settings: PipelineSettings,
+    video_metadata: VideoMetadata,
+    sharpness_scores: list[float],
+    alignment_results: list[AlignmentResult],
     accepted_count: int,
     applied_min_inlier_ratio: float,
     cropped_output_image_bgr: np.ndarray | None,
 ) -> list[str]:
     """Build human-readable pipeline warnings."""
     warnings: list[str] = []
-    if accepted_count < settings.min_matches:
+    video_width = int(video_metadata.get("width", 0))
+    video_height = int(video_metadata.get("height", 0))
+    min_dimension = min(video_width, video_height)
+    megapixels = (video_width * video_height) / 1_000_000 if video_width and video_height else 0
+
+    if accepted_count < 10:
         warnings.append(
-            "Accepted frame count stayed below the minimum target after relaxing "
-            "the inlier-ratio threshold."
+            "Fewer than 10 frames were accepted, so the long-exposure effect may be weak."
         )
+    if accepted_count < settings.min_matches:
+        if settings.enable_alignment:
+            warnings.append(
+                "Accepted frame count stayed below the minimum target after relaxing "
+                "the inlier-ratio threshold."
+            )
+        else:
+            warnings.append("Fewer frames than the minimum target were available.")
+    if min_dimension and (min_dimension < 720 or megapixels < 0.75):
+        warnings.append(
+            "Source video resolution is low; the final image may look soft or compressed."
+        )
+    if sharpness_scores and float(np.median(sharpness_scores)) < 80:
+        warnings.append(
+            "Many source frames appear soft or blurred, so averaging cannot recover crisp detail."
+        )
+    if settings.enable_alignment and alignment_results and video_width and video_height:
+        max_movement_px = _max_transform_movement_px(
+            alignment_results,
+            alignment_results[0].frame.shape[:2],
+        )
+        movement_limit = 0.18 * min(alignment_results[0].frame.shape[:2])
+        if max_movement_px > movement_limit:
+            warnings.append(
+                "Estimated frame movement is large; alignment may crop heavily or leave softness."
+            )
     if settings.enable_alignment and settings.min_inlier_ratio == AUTO_INLIER_RATIO_SENTINEL:
         warnings.append(
             f"Auto inlier ratio selected {applied_min_inlier_ratio:.2f} "
             "to meet the minimum-match target."
         )
-    elif applied_min_inlier_ratio < settings.min_inlier_ratio:
+    elif settings.enable_alignment and applied_min_inlier_ratio < settings.min_inlier_ratio:
         warnings.append(
             f"Inlier ratio was relaxed from {settings.min_inlier_ratio:.2f} "
             f"to {applied_min_inlier_ratio:.2f}."
@@ -522,6 +583,9 @@ def run_pipeline(
 
     warnings = _result_warnings(
         settings,
+        preview.video_metadata,
+        preview.sharpness_scores,
+        stack_job.alignment_results,
         accepted_count,
         stack_job.applied_min_inlier_ratio,
         cropped_output_image_bgr,

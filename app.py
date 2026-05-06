@@ -23,7 +23,11 @@ from longexposure.blending import (
     extract_paint_mask_from_canvas,
     make_alignment_allowed_mask,
 )
-from longexposure.diagnostics import sharpness_figure
+from longexposure.diagnostics import (
+    accepted_rejected_figure,
+    inlier_ratio_figure,
+    sharpness_figure,
+)
 from longexposure.frames import ReferenceStrategy
 from longexposure.io import get_video_summary, save_uploaded_video_to_temp
 from longexposure.pipeline import (
@@ -68,6 +72,14 @@ OUTPUT_SECTION_LABELS = {
     "median": "Median Stack",
     "sigma_clipped_mean": "Sigma-Clipped Mean Stack",
 }
+BEST_RESULTS_TIPS = [
+    "Use full-resolution video.",
+    "Keep the camera as still as possible.",
+    "Include static rocks, trees, buildings, or landscape for alignment.",
+    "Avoid extreme parallax between foreground and background.",
+    "Avoid heavy wind in foliage when it is needed for alignment.",
+    "Use 2-5 seconds for waterfalls and streams.",
+]
 
 
 def _inject_ui_styles() -> None:
@@ -206,6 +218,13 @@ def _render_summary_table(table: pd.DataFrame) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def _render_best_results() -> None:
+    """Render short capture guidance for reviewers and users."""
+    with st.expander("How to get best results"):
+        for tip in BEST_RESULTS_TIPS:
+            st.markdown(f"- {tip}")
 
 
 def _target_min_matches(frame_count_hint: int | None) -> int:
@@ -442,6 +461,65 @@ def _extract_guidance_mask(
     return paint_alpha, allowed_mask, float(np.mean(paint_alpha > 0.05))
 
 
+def _crop_image_for_display(
+    image_bgr: np.ndarray,
+    crop_rect: tuple[int, int, int, int] | None,
+) -> np.ndarray:
+    """Crop an image by the pipeline crop rect when present."""
+    if crop_rect is None:
+        return image_bgr
+
+    x_min, y_min, x_max, y_max = crop_rect
+    return image_bgr[y_min:y_max, x_min:x_max]
+
+
+def _split_comparison_image(
+    reference_rgb: np.ndarray,
+    final_rgb: np.ndarray,
+) -> np.ndarray:
+    """Build a left/right wipe comparison image."""
+    if reference_rgb.shape != final_rgb.shape:
+        raise ValueError("reference_rgb and final_rgb must have matching shapes")
+
+    height, width = final_rgb.shape[:2]
+    split_x = width // 2
+    comparison = final_rgb.copy()
+    comparison[:, :split_x] = reference_rgb[:, :split_x]
+
+    line_x = int(np.clip(split_x, 1, max(1, width - 1)))
+    cv2.line(comparison, (line_x, 0), (line_x, height), (255, 255, 255), 1)
+    return comparison
+
+
+def _render_output_viewer(
+    final_rgb: np.ndarray,
+    reference_rgb: np.ndarray | None,
+    selected_count: int,
+    mode_label: str,
+) -> None:
+    """Render final output with optional reference comparison modes."""
+    viewer_options = ["Final output"]
+    if reference_rgb is not None and reference_rgb.shape == final_rgb.shape:
+        viewer_options.extend(["Reference vs final", "Split comparison"])
+
+    viewer_mode = st.radio("Output view", viewer_options, horizontal=True)
+    if viewer_mode == "Reference vs final" and reference_rgb is not None:
+        reference_column, final_column = st.columns(2)
+        reference_column.image(reference_rgb, caption="Reference frame")
+        final_column.image(final_rgb, caption=f"{mode_label} ({selected_count} frames)")
+    elif viewer_mode == "Split comparison" and reference_rgb is not None:
+        comparison_rgb = _split_comparison_image(
+            reference_rgb,
+            final_rgb,
+        )
+        st.image(
+            comparison_rgb,
+            caption=f"Reference left, final right ({selected_count} frames)",
+        )
+    else:
+        st.image(final_rgb, caption=f"{mode_label} ({selected_count} frames)")
+
+
 def _render_preview_and_mask(
     preview: PreviewResult,
     *,
@@ -523,6 +601,16 @@ def _render_pipeline_result(result: PipelineResult, settings: PipelineSettings) 
         pd.DataFrame(result.alignment_diagnostics),
         hide_index=True,
     )
+    if result.alignment_results is not None:
+        diagnostic_columns = st.columns(2)
+        diagnostic_columns[0].pyplot(
+            accepted_rejected_figure(result.alignment_results),
+            use_container_width=False,
+        )
+        diagnostic_columns[1].pyplot(
+            inlier_ratio_figure(result.alignment_results),
+            use_container_width=False,
+        )
 
     for warning in result.warnings:
         st.warning(warning)
@@ -557,16 +645,31 @@ def _render_pipeline_result(result: PipelineResult, settings: PipelineSettings) 
             if subset.cropped_output_image_bgr is not None
             else subset.output_image_bgr
         )
+        display_crop_rect = subset.crop_rect
+    else:
+        display_crop_rect = result.crop_rect
 
     final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
+    reference_rgb = None
+    if result.reference_frame_bgr is not None:
+        reference_bgr = _crop_image_for_display(
+            result.reference_frame_bgr,
+            display_crop_rect,
+        )
+        if reference_bgr.shape == final_bgr.shape:
+            reference_rgb = cv2.cvtColor(reference_bgr, cv2.COLOR_BGR2RGB)
+
     _save_output_images(final_bgr)
     png_bytes = _encode_image(final_bgr, ".png")
     jpg_bytes = _encode_image(final_bgr, ".jpg")
 
-    st.subheader(OUTPUT_SECTION_LABELS[settings.stack_mode])
-    st.image(
+    output_label = OUTPUT_SECTION_LABELS[settings.stack_mode]
+    st.subheader(output_label)
+    _render_output_viewer(
         final_rgb,
-        caption=f"Photographic full-frame average ({selected_count} frames)",
+        reference_rgb,
+        selected_count,
+        output_label,
     )
     download_columns = st.columns(2)
     download_columns[0].download_button(
@@ -654,6 +757,7 @@ def main() -> None:
 
         st.subheader("Video Metadata")
         _render_summary_table(_metadata_table(summary))
+        _render_best_results()
 
         if update_preview or preview_result is None:
             with st.status("Preparing mask preview", expanded=True) as status:

@@ -13,21 +13,39 @@ The app is designed around an honest photographic process:
 6. Crop unstable borders.
 7. Export the final image.
 
-This first scaffold does not implement the full alignment and rejection
-algorithm yet. It establishes the project structure, runnable Streamlit app, and
-typed module boundaries so the image processing logic can be built in deliberate
-steps.
-
 ## Honest Photographic Average Mode
 
 The core visual idea is a real average of video frames, not a synthetic blur or
-AI-generated image. When the algorithm is complete, each accepted frame will
-contribute light and color to the final still after being aligned to the chosen
-reference view.
+AI-generated image. Each accepted frame contributes light and color to the final
+still after being aligned to the chosen reference view.
 
 This approach can create water, sky, traffic, crowd, and handheld motion effects
 that resemble long-exposure photography while preserving a clear relationship to
 the source video.
+
+## Stacking Modes
+
+- Mean photographic average: best for waterfalls, streams, clouds, and smoothing
+  motion.
+- Median: useful for cleanup, but it suppresses transient motion.
+- Sigma-clipped mean: cleanup-oriented averaging for noisy or inconsistent
+  frames.
+- Lighten / star trails: preserves the brightest pixel/channel values for star
+  trails, light trails, and fireworks.
+- Additive / sum: experimental brightening mode that can saturate highlights
+  quickly.
+
+## How To Get Best Results
+
+- Use full-resolution video.
+- Keep the camera as still as possible.
+- Include static rocks, trees, buildings, or landscape for alignment.
+- Avoid extreme parallax between foreground and background.
+- Avoid heavy wind in foliage when it is needed for alignment.
+- Use 2-5 seconds for waterfalls and streams.
+- For tripod star trails, disable alignment so the stars can trail naturally.
+  If alignment is needed for a night landscape, guide it with static foreground
+  rather than stars.
 
 ## Limitations
 
@@ -38,7 +56,8 @@ the source video.
   alignment.
 - Alignment can stabilize the camera view, but it cannot invent detail that was
   not captured in the original frames.
-- The current scaffold uses placeholder alignment and crop logic.
+- Low-resolution or blurred source video will still look soft after averaging.
+- Additive stacking can clip bright highlights quickly.
 
 ## Why Video May Still Be Soft After Alignment
 
@@ -76,6 +95,5 @@ SaaS app. The interesting work is in making the photographic pipeline visible:
 frame extraction, reference choice, alignment quality, rejection decisions,
 averaging, border handling, and export.
 
-Good future improvements include real OpenCV alignment, explicit frame rejection
-metrics, diagnostic plots, before/after comparisons, and sample videos with
-documented tradeoffs.
+Good future improvements include sample videos with documented tradeoffs,
+presets for common shooting scenarios, and richer export controls.

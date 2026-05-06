@@ -89,3 +89,38 @@ def sharpness_figure(scores: list[float], reference_index: int) -> Figure:
     axis.grid(True, alpha=0.25)
 
     return figure
+
+
+def accepted_rejected_figure(results: list[AlignmentResult]) -> Figure:
+    """Build a compact accepted/rejected count chart."""
+    accepted = sum(1 for result in results if result.accepted)
+    rejected = len(results) - accepted
+    figure = Figure(figsize=(4.2, 2.2), layout="constrained")
+    axis = figure.subplots()
+    axis.bar(
+        ["Accepted", "Rejected"],
+        [accepted, rejected],
+        color=["#2f8f5b", "#b84a4a"],
+    )
+    axis.set_title("Frame acceptance")
+    axis.set_ylabel("Frames")
+    axis.grid(True, axis="y", alpha=0.25)
+    return figure
+
+
+def inlier_ratio_figure(results: list[AlignmentResult]) -> Figure:
+    """Build a frame-index plot of alignment inlier ratios."""
+    figure = Figure(figsize=(5.4, 2.4), layout="constrained")
+    axis = figure.subplots()
+    frame_numbers = list(range(len(results)))
+    ratios = [result.inlier_ratio for result in results]
+    colors = ["#2f8f5b" if result.accepted else "#b84a4a" for result in results]
+
+    axis.plot(frame_numbers, ratios, color="#6d7685", linewidth=1.3, alpha=0.8)
+    axis.scatter(frame_numbers, ratios, color=colors, s=22, zorder=3)
+    axis.set_title("Alignment inlier ratio")
+    axis.set_xlabel("Extracted frame index")
+    axis.set_ylabel("Inlier ratio")
+    axis.set_ylim(0, 1.02)
+    axis.grid(True, alpha=0.25)
+    return figure
