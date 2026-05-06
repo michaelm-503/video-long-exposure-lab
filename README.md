@@ -47,6 +47,21 @@ the source video.
   If alignment is needed for a night landscape, guide it with static foreground
   rather than stars.
 
+## Demo Gallery
+
+The app includes a Demo Gallery mode so a hosted portfolio deployment can explain
+the available sample sources even when the visitor does not upload a video.
+
+The repository does not commit large media files. Demo mode supports:
+
+- hosted sample clips from
+  [Demo Media v1](https://github.com/michaelm-503/predictive-maintenance-risk-dashboard/releases/tag/demo-media-v1)
+- local videos placed in `sample_data/`
+- direct remote video URLs for `.mp4`, `.mov`, or `.m4v` files
+
+The hosted demo clips are GitHub Release assets, which gives the app stable
+direct `.mp4`/`.mov` URLs without storing large media in git history.
+
 ## Limitations
 
 - Video frames are compressed, often noisy, and usually lower quality than still
