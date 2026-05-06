@@ -43,8 +43,10 @@ class PipelineSettings:
     min_matches: int = 10
     min_inlier_ratio: float = 1.0
     ransac_reproj_threshold: float = 3.0
+    enable_alignment: bool = True
     stack_mode: StackingMode = "mean"
     sigma: float = 2.5
+    additive_gain: float = 1.0
     crop_borders: bool = True
     valid_border_threshold: float = 0.98
 
@@ -94,8 +96,10 @@ class StackJobSettings:
     min_matches: int = 10
     min_inlier_ratio: float = 1.0
     ransac_reproj_threshold: float = 3.0
+    enable_alignment: bool = True
     stack_mode: StackingMode = "mean"
     sigma: float = 2.5
+    additive_gain: float = 1.0
     crop_borders: bool = True
     valid_border_threshold: float = 0.98
 
@@ -208,7 +212,7 @@ def _result_warnings(
             "Accepted frame count stayed below the minimum target after relaxing "
             "the inlier-ratio threshold."
         )
-    if settings.min_inlier_ratio == AUTO_INLIER_RATIO_SENTINEL:
+    if settings.enable_alignment and settings.min_inlier_ratio == AUTO_INLIER_RATIO_SENTINEL:
         warnings.append(
             f"Auto inlier ratio selected {applied_min_inlier_ratio:.2f} "
             "to meet the minimum-match target."
@@ -227,6 +231,12 @@ def _result_warnings(
         warnings.append(
             "Sigma-clipped mean is computational cleanup, not a pure photographic average."
         )
+    if settings.stack_mode == "additive":
+        warnings.append("Additive stacking can saturate highlights quickly.")
+    if settings.stack_mode in {"lighten", "additive"} and settings.enable_alignment:
+        warnings.append(
+            "For tripod star trails, disable alignment or align only to static foreground."
+        )
     if settings.crop_borders and cropped_output_image_bgr is None:
         warnings.append("Border cropping was enabled but no crop was applied.")
 
@@ -241,8 +251,10 @@ def stack_settings_from_pipeline(settings: PipelineSettings) -> StackJobSettings
         min_matches=settings.min_matches,
         min_inlier_ratio=settings.min_inlier_ratio,
         ransac_reproj_threshold=settings.ransac_reproj_threshold,
+        enable_alignment=settings.enable_alignment,
         stack_mode=settings.stack_mode,
         sigma=settings.sigma,
+        additive_gain=settings.additive_gain,
         crop_borders=settings.crop_borders,
         valid_border_threshold=settings.valid_border_threshold,
     )
@@ -257,8 +269,10 @@ def relaxed_stack_settings(strictness: float, settings: PipelineSettings) -> Sta
         min_matches=round(8 + bounded * 22),
         min_inlier_ratio=0.12 + bounded * 0.38,
         ransac_reproj_threshold=6.0 - bounded * 3.0,
+        enable_alignment=settings.enable_alignment,
         stack_mode=settings.stack_mode,
         sigma=settings.sigma,
+        additive_gain=settings.additive_gain,
         crop_borders=False,
         valid_border_threshold=settings.valid_border_threshold,
     )
@@ -271,6 +285,30 @@ def _crop_image(image_bgr: np.ndarray, crop_rect: tuple[int, int, int, int] | No
 
     x_min, y_min, x_max, y_max = crop_rect
     return image_bgr[y_min:y_max, x_min:x_max]
+
+
+def _identity_matrix() -> np.ndarray:
+    """Return a 2x3 identity affine transform matrix."""
+    return np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+
+
+def _alignment_disabled_results(
+    frames: list[np.ndarray],
+    reference_index: int,
+) -> list[AlignmentResult]:
+    """Accept all frames without warping when alignment is disabled."""
+    identity = _identity_matrix()
+    return [
+        AlignmentResult(
+            frame=frame,
+            accepted=True,
+            score=1.0 if index == reference_index else 0.0,
+            reason="reference frame" if index == reference_index else "alignment disabled",
+            status="reference" if index == reference_index else "alignment disabled",
+            matrix=identity.copy(),
+        )
+        for index, frame in enumerate(frames)
+    ]
 
 
 def accepted_alignment_order(alignment_results: list[AlignmentResult]) -> list[int]:
@@ -327,6 +365,7 @@ def stack_alignment_subset(
     *,
     stack_mode: StackingMode = "mean",
     sigma: float = 2.5,
+    additive_gain: float = 1.0,
     crop_borders: bool = True,
     valid_border_threshold: float = 0.98,
 ) -> StackSubsetResult:
@@ -339,6 +378,7 @@ def stack_alignment_subset(
         [result.frame for result in selected_results],
         stack_mode,
         sigma,
+        additive_gain,
     )
 
     crop_rect = None
@@ -363,24 +403,29 @@ def run_stack_job(
     alignment_allowed_mask: np.ndarray | None = None,
 ) -> StackJobResult:
     """Align and stack already-extracted frames against the selected reference."""
-    alignment_settings = AlignmentSettings(
-        max_features=stack_settings.orb_max_features,
-        keep_matches=stack_settings.orb_keep_matches,
-        min_matches=stack_settings.min_matches,
-        min_inlier_ratio=0.0,
-        ransac_reproj_threshold=stack_settings.ransac_reproj_threshold,
-    )
-    raw_alignment_results = align_frames(
-        frames,
-        reference_index,
-        alignment_settings,
-        alignment_allowed_mask=alignment_allowed_mask,
-    )
-    applied_min_inlier_ratio, alignment_results = _resolve_inlier_ratio_threshold(
-        raw_alignment_results,
-        stack_settings.min_inlier_ratio,
-        stack_settings.min_matches,
-    )
+    if stack_settings.enable_alignment:
+        alignment_settings = AlignmentSettings(
+            max_features=stack_settings.orb_max_features,
+            keep_matches=stack_settings.orb_keep_matches,
+            min_matches=stack_settings.min_matches,
+            min_inlier_ratio=0.0,
+            ransac_reproj_threshold=stack_settings.ransac_reproj_threshold,
+        )
+        raw_alignment_results = align_frames(
+            frames,
+            reference_index,
+            alignment_settings,
+            alignment_allowed_mask=alignment_allowed_mask,
+        )
+        applied_min_inlier_ratio, alignment_results = _resolve_inlier_ratio_threshold(
+            raw_alignment_results,
+            stack_settings.min_inlier_ratio,
+            stack_settings.min_matches,
+        )
+    else:
+        alignment_results = _alignment_disabled_results(frames, reference_index)
+        applied_min_inlier_ratio = 0.0
+
     accepted_aligned_frames = accepted_frames(alignment_results)
     accepted_count = len(accepted_aligned_frames)
     rejected_count = len(alignment_results) - accepted_count
@@ -388,6 +433,7 @@ def run_stack_job(
         accepted_aligned_frames,
         stack_settings.stack_mode,
         stack_settings.sigma,
+        stack_settings.additive_gain,
     )
 
     crop_rect = None

@@ -48,9 +48,25 @@ VIDEO_MIME_TYPES = {
     ".mp4": "video/mp4",
 }
 STACKING_MODE_LABELS: dict[str, StackingMode] = {
-    "Mean": "mean",
-    "Sigma-clipped mean (cleanup)": "sigma_clipped_mean",
-    "Median (experimental)": "median",
+    "Mean photographic average": "mean",
+    "Median": "median",
+    "Sigma-clipped mean": "sigma_clipped_mean",
+    "Lighten / star trails": "lighten",
+    "Additive / sum": "additive",
+}
+STACKING_MODE_GUIDANCE = {
+    "mean": "Best for waterfalls, streams, clouds, and smoothing motion.",
+    "median": "Useful for cleanup, but it suppresses transient motion.",
+    "sigma_clipped_mean": "Cleanup-oriented mean; can be slower at full resolution.",
+    "lighten": "Best for star trails, light trails, and fireworks.",
+    "additive": "Experimental; brightens quickly and can saturate highlights.",
+}
+OUTPUT_SECTION_LABELS = {
+    "additive": "Additive Stack",
+    "lighten": "Lighten / Star Trails Stack",
+    "mean": "Photographic Full-Frame Average",
+    "median": "Median Stack",
+    "sigma_clipped_mean": "Sigma-Clipped Mean Stack",
 }
 
 
@@ -249,6 +265,14 @@ def _settings_from_sidebar(
         )
 
         st.header("Alignment")
+        enable_alignment = st.checkbox(
+            "Enable alignment",
+            value=True,
+            help=(
+                "For tripod star trails, disable alignment so the stars can trail. "
+                "If using alignment for night scenes, guide it with static foreground."
+            ),
+        )
         orb_max_features = st.number_input(
             "Max ORB features",
             min_value=100,
@@ -303,6 +327,7 @@ def _settings_from_sidebar(
             index=0,
         )
         stack_mode = STACKING_MODE_LABELS[stacking_label]
+        st.caption(STACKING_MODE_GUIDANCE[stack_mode])
         sigma = st.number_input(
             "Sigma clipping",
             min_value=0.5,
@@ -310,6 +335,16 @@ def _settings_from_sidebar(
             value=2.5,
             step=0.1,
         )
+        additive_gain = 1.0
+        if stack_mode == "additive":
+            additive_gain = st.number_input(
+                "Additive gain",
+                min_value=0.0,
+                max_value=10.0,
+                value=1.0,
+                step=0.1,
+                help="Scales the summed frame values before clipping to 0..255.",
+            )
         crop_borders = st.checkbox("Crop borders", value=True)
         valid_border_threshold = st.slider(
             "Valid border threshold",
@@ -331,8 +366,10 @@ def _settings_from_sidebar(
         min_matches=int(min_matches),
         min_inlier_ratio=float(min_inlier_ratio),
         ransac_reproj_threshold=float(ransac_reproj_threshold),
+        enable_alignment=bool(enable_alignment),
         stack_mode=stack_mode,
         sigma=float(sigma),
+        additive_gain=float(additive_gain),
         crop_borders=bool(crop_borders),
         valid_border_threshold=float(valid_border_threshold),
     )
@@ -511,6 +548,7 @@ def _render_pipeline_result(result: PipelineResult, settings: PipelineSettings) 
             selected_count,
             stack_mode=settings.stack_mode,
             sigma=settings.sigma,
+            additive_gain=settings.additive_gain,
             crop_borders=settings.crop_borders,
             valid_border_threshold=settings.valid_border_threshold,
         )
@@ -525,7 +563,7 @@ def _render_pipeline_result(result: PipelineResult, settings: PipelineSettings) 
     png_bytes = _encode_image(final_bgr, ".png")
     jpg_bytes = _encode_image(final_bgr, ".jpg")
 
-    st.subheader("Photographic Full-Frame Average")
+    st.subheader(OUTPUT_SECTION_LABELS[settings.stack_mode])
     st.image(
         final_rgb,
         caption=f"Photographic full-frame average ({selected_count} frames)",

@@ -9,7 +9,13 @@ import numpy as np
 
 from longexposure.alignment import AlignmentResult
 
-StackingMode = Literal["mean", "sigma_clipped_mean", "median"]
+StackingMode = Literal[
+    "mean",
+    "sigma_clipped_mean",
+    "median",
+    "lighten",
+    "additive",
+]
 MAX_STACK_CHUNK_BYTES = 128 * 1024 * 1024
 
 
@@ -86,10 +92,36 @@ def sigma_clipped_mean_stack(
     return output
 
 
+def lighten_stack(frames_bgr: list[np.ndarray]) -> np.ndarray:
+    """Keep the brightest value at each pixel/channel for trails and fireworks."""
+    if not frames_bgr:
+        raise ValueError("At least one accepted frame is required")
+
+    lightened = frames_bgr[0].copy()
+    for frame in frames_bgr[1:]:
+        np.maximum(lightened, frame, out=lightened)
+    return lightened
+
+
+def additive_stack(frames_bgr: list[np.ndarray], gain: float = 1.0) -> np.ndarray:
+    """Sum frames in float space, then scale and clip highlights."""
+    if not frames_bgr:
+        raise ValueError("At least one accepted frame is required")
+    if gain < 0:
+        raise ValueError("additive gain must be non-negative")
+
+    accumulated = np.zeros(frames_bgr[0].shape, dtype=np.float32)
+    for frame in frames_bgr:
+        accumulated += frame.astype(np.float32)
+    accumulated *= gain
+    return np.clip(accumulated, 0, 255).astype(np.uint8)
+
+
 def stack_frames(
     frames_bgr: list[np.ndarray],
     mode: StackingMode = "mean",
     sigma: float = 2.5,
+    additive_gain: float = 1.0,
 ) -> np.ndarray:
     """Stack BGR frames with the selected stacking mode."""
     if mode == "mean":
@@ -98,6 +130,10 @@ def stack_frames(
         return sigma_clipped_mean_stack(frames_bgr, sigma)
     if mode == "median":
         return median_stack(frames_bgr)
+    if mode == "lighten":
+        return lighten_stack(frames_bgr)
+    if mode == "additive":
+        return additive_stack(frames_bgr, additive_gain)
 
     raise ValueError(f"Unsupported stacking mode: {mode}")
 
