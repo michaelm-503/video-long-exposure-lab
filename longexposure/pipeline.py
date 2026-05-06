@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 from longexposure.alignment import AlignmentResult, AlignmentSettings, align_frames
@@ -65,6 +66,22 @@ class PipelineResult:
     reference_frame_bgr: np.ndarray | None = None
     applied_min_inlier_ratio: float = 0.0
     frames_bgr: list[np.ndarray] | None = None
+    alignment_results: list[AlignmentResult] | None = None
+    crop_rect: tuple[int, int, int, int] | None = None
+    mask_coverage: float = 0.0
+
+
+@dataclass(frozen=True)
+class PreviewResult:
+    """Low-resolution frame/reference data used before the full pipeline run."""
+
+    video_metadata: VideoMetadata
+    extraction_metadata: VideoMetadata
+    frames_processed: int
+    reference_index: int
+    sharpness_scores: list[float]
+    reference_frame_bgr: np.ndarray
+    frames_bgr: list[np.ndarray]
 
 
 @dataclass(frozen=True)
@@ -95,6 +112,16 @@ class StackJobResult:
     diagnostics: list[dict[str, object]]
     alignment_results: list[AlignmentResult]
     applied_min_inlier_ratio: float
+
+
+@dataclass(frozen=True)
+class StackSubsetResult:
+    """A restacked subset of accepted aligned frames."""
+
+    output_image_bgr: np.ndarray
+    cropped_output_image_bgr: np.ndarray | None
+    crop_rect: tuple[int, int, int, int] | None
+    selected_indices: list[int]
 
 
 def _apply_inlier_ratio_threshold(
@@ -220,6 +247,63 @@ def _crop_image(image_bgr: np.ndarray, crop_rect: tuple[int, int, int, int] | No
     return image_bgr[y_min:y_max, x_min:x_max]
 
 
+def accepted_alignment_order(alignment_results: list[AlignmentResult]) -> list[int]:
+    """Return accepted result indices in a stable quality order for restacking."""
+    accepted_indices = [
+        index for index, result in enumerate(alignment_results) if result.accepted
+    ]
+    reference_indices = [
+        index for index in accepted_indices if alignment_results[index].status == "reference"
+    ]
+    aligned_indices = [
+        index for index in accepted_indices if alignment_results[index].status != "reference"
+    ]
+    aligned_indices.sort(
+        key=lambda index: (
+            alignment_results[index].inlier_ratio,
+            alignment_results[index].inliers,
+            alignment_results[index].matches,
+        ),
+        reverse=True,
+    )
+    return reference_indices + aligned_indices
+
+
+def stack_alignment_subset(
+    alignment_results: list[AlignmentResult],
+    frame_count: int,
+    *,
+    stack_mode: StackingMode = "mean",
+    sigma: float = 2.5,
+    crop_borders: bool = True,
+    valid_border_threshold: float = 0.98,
+) -> StackSubsetResult:
+    """Stack the top accepted aligned frames by inlier quality."""
+    ordered_indices = accepted_alignment_order(alignment_results)
+    bounded_count = max(1, min(frame_count, len(ordered_indices)))
+    selected_indices = ordered_indices[:bounded_count]
+    selected_results = [alignment_results[index] for index in selected_indices]
+    output_image_bgr = stack_frames(
+        [result.frame for result in selected_results],
+        stack_mode,
+        sigma,
+    )
+
+    crop_rect = None
+    cropped_output_image_bgr: np.ndarray | None = None
+    if crop_borders:
+        crop_rect = valid_region_crop_rect(selected_results, valid_border_threshold)
+        if crop_rect is not None:
+            cropped_output_image_bgr = _crop_image(output_image_bgr, crop_rect)
+
+    return StackSubsetResult(
+        output_image_bgr=output_image_bgr,
+        cropped_output_image_bgr=cropped_output_image_bgr,
+        crop_rect=crop_rect,
+        selected_indices=selected_indices,
+    )
+
+
 def run_stack_job(
     frames: list[np.ndarray],
     reference_index: int,
@@ -278,8 +362,8 @@ def run_stack_job(
     )
 
 
-def run_pipeline(video_path: str | Path, settings: PipelineSettings) -> PipelineResult:
-    """Run video extraction, reference selection, alignment, stacking, and crop."""
+def run_preview(video_path: str | Path, settings: PipelineSettings) -> PreviewResult:
+    """Extract frames and select the reference frame for the mask preview."""
     resolved_path = Path(video_path)
     video_metadata = get_video_summary(resolved_path)
     frames_bgr, extraction_metadata = extract_frames(
@@ -297,10 +381,39 @@ def run_pipeline(video_path: str | Path, settings: PipelineSettings) -> Pipeline
         settings.reference_strategy,
     )
 
+    return PreviewResult(
+        video_metadata=video_metadata,
+        extraction_metadata=extraction_metadata,
+        frames_processed=frames_processed,
+        reference_index=reference_index,
+        sharpness_scores=sharpness_scores,
+        reference_frame_bgr=reference_frame_bgr,
+        frames_bgr=frames_bgr,
+    )
+
+
+def run_pipeline(
+    video_path: str | Path,
+    settings: PipelineSettings,
+    alignment_allowed_mask: np.ndarray | None = None,
+) -> PipelineResult:
+    """Run video extraction, guided alignment, full-frame stacking, and crop."""
+    preview = run_preview(video_path, settings)
+    resolved_alignment_allowed_mask = alignment_allowed_mask
+    if resolved_alignment_allowed_mask is not None:
+        output_height, output_width = preview.reference_frame_bgr.shape[:2]
+        if resolved_alignment_allowed_mask.shape != (output_height, output_width):
+            resolved_alignment_allowed_mask = cv2.resize(
+                resolved_alignment_allowed_mask,
+                (output_width, output_height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
     stack_job = run_stack_job(
-        frames_bgr,
-        reference_index,
+        preview.frames_bgr,
+        preview.reference_index,
         stack_settings_from_pipeline(settings),
+        alignment_allowed_mask=resolved_alignment_allowed_mask,
     )
     accepted_count = stack_job.accepted_count
     rejected_count = stack_job.rejected_count
@@ -315,20 +428,28 @@ def run_pipeline(video_path: str | Path, settings: PipelineSettings) -> Pipeline
         stack_job.applied_min_inlier_ratio,
         cropped_output_image_bgr,
     )
+    mask_coverage = (
+        float(np.mean(resolved_alignment_allowed_mask == 0))
+        if resolved_alignment_allowed_mask is not None
+        else 0.0
+    )
 
     return PipelineResult(
-        video_metadata=video_metadata,
-        frames_processed=frames_processed,
-        reference_index=reference_index,
-        sharpness_scores=sharpness_scores,
+        video_metadata=preview.video_metadata,
+        frames_processed=preview.frames_processed,
+        reference_index=preview.reference_index,
+        sharpness_scores=preview.sharpness_scores,
         alignment_diagnostics=stack_job.diagnostics,
         accepted_count=accepted_count,
         rejected_count=rejected_count,
         output_image_bgr=output_image_bgr,
         cropped_output_image_bgr=cropped_output_image_bgr,
         warnings=warnings,
-        first_frame_bgr=frames_bgr[0] if frames_bgr else None,
-        reference_frame_bgr=reference_frame_bgr,
+        first_frame_bgr=preview.frames_bgr[0] if preview.frames_bgr else None,
+        reference_frame_bgr=preview.reference_frame_bgr,
         applied_min_inlier_ratio=stack_job.applied_min_inlier_ratio,
-        frames_bgr=frames_bgr,
+        frames_bgr=preview.frames_bgr,
+        alignment_results=stack_job.alignment_results,
+        crop_rect=stack_job.crop_rect,
+        mask_coverage=mask_coverage,
     )

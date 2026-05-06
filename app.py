@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from html import escape
 from pathlib import Path
 from typing import cast
@@ -18,9 +19,7 @@ except ImportError:  # pragma: no cover - depends on local environment install
     st_canvas = None
 
 from longexposure.blending import (
-    blend_with_alpha,
     extract_paint_mask_from_canvas,
-    feather_mask,
     make_alignment_allowed_mask,
 )
 from longexposure.diagnostics import sharpness_figure
@@ -29,20 +28,51 @@ from longexposure.io import get_video_summary, save_uploaded_video_to_temp
 from longexposure.pipeline import (
     PipelineResult,
     PipelineSettings,
-    relaxed_stack_settings,
+    PreviewResult,
+    run_preview,
     run_pipeline,
-    run_stack_job,
+    stack_alignment_subset,
 )
 from longexposure.stacking import StackingMode
 
 
 APP_TITLE = "Video Long Exposure Lab"
 OUTPUT_DIR = Path("outputs")
+PREVIEW_RESIZE_WIDTH = 800
+PREVIEW_FRAME_REFRESH_THRESHOLD = 120
 STACKING_MODE_LABELS: dict[str, StackingMode] = {
     "Mean": "mean",
     "Sigma-clipped mean (cleanup)": "sigma_clipped_mean",
     "Median (experimental)": "median",
 }
+
+
+def _inject_ui_styles() -> None:
+    """Keep media previews content-sized in Streamlit 1.40."""
+    st.markdown(
+        """
+        <style>
+            div[data-testid="stVideo"],
+            .stVideo {
+                display: inline-block;
+                width: fit-content;
+                max-width: 100%;
+            }
+            div[data-testid="stVideo"] > div,
+            .stVideo > div {
+                width: fit-content !important;
+                max-width: 100%;
+            }
+            div[data-testid="stVideo"] video,
+            .stVideo video {
+                width: auto !important;
+                max-width: 100% !important;
+                max-height: 70vh;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _encode_image(image_bgr: np.ndarray, extension: str) -> bytes:
@@ -149,9 +179,11 @@ def _settings_from_sidebar(
     *,
     video_width: int,
     video_duration: float,
+    frame_count_hint: int | None = None,
 ) -> PipelineSettings:
     """Collect Streamlit sidebar controls into pipeline settings."""
-    default_resize_width = round(video_width * 0.95) if video_width > 0 else 1
+    default_resize_width = video_width if video_width > 0 else 1
+    default_min_matches = max(10, round((frame_count_hint or 20) * 0.5))
 
     with st.sidebar:
         st.header("Processing")
@@ -159,7 +191,7 @@ def _settings_from_sidebar(
             "Maximum frames",
             min_value=5,
             max_value=300,
-            value=90,
+            value=300,
             step=5,
         )
         frame_stride = st.number_input(
@@ -185,7 +217,7 @@ def _settings_from_sidebar(
         duration_s = st.number_input(
             "Duration seconds to process",
             min_value=0.1,
-            value=min(3.0, video_duration) if video_duration > 0 else 3.0,
+            value=video_duration if video_duration > 0 else 3.0,
             step=0.5,
         )
         reference_strategy = cast(
@@ -216,7 +248,7 @@ def _settings_from_sidebar(
             "Minimum matches",
             min_value=3,
             max_value=500,
-            value=10,
+            value=default_min_matches,
             step=1,
         )
         min_inlier_ratio = st.slider(
@@ -276,38 +308,136 @@ def _settings_from_sidebar(
     )
 
 
-def _render_pipeline_result(result: PipelineResult) -> None:
-    """Render pipeline output and diagnostics."""
+def _preview_settings(settings: PipelineSettings, video_width: int) -> PipelineSettings:
+    """Use the same processing window at a smaller width for mask preview."""
+    preview_width = min(PREVIEW_RESIZE_WIDTH, video_width) if video_width > 0 else PREVIEW_RESIZE_WIDTH
+    return replace(settings, resize_width=preview_width)
+
+
+def _processing_signature(settings: PipelineSettings) -> tuple[object, ...]:
+    """Return the setting values that should invalidate preview/results."""
+    return tuple(settings.__dict__.items())
+
+
+def _output_size_from_metadata(
+    metadata: dict[str, float | int],
+    resize_width: int | None,
+) -> tuple[int, int]:
+    """Return the expected final frame size as height, width."""
+    source_width = int(metadata["width"])
+    source_height = int(metadata["height"])
+    if resize_width is None or resize_width <= 0 or resize_width >= source_width:
+        return source_height, source_width
+
+    output_height = max(1, round(source_height * resize_width / source_width))
+    return output_height, int(resize_width)
+
+
+def _extract_guidance_mask(
+    canvas_result,
+    background_rgb_display: np.ndarray,
+    preview_size: tuple[int, int],
+    output_size: tuple[int, int],
+) -> tuple[np.ndarray | None, np.ndarray | None, float]:
+    """Extract painted alpha and convert it to an ORB allowed-region mask."""
+    paint_alpha = extract_paint_mask_from_canvas(
+        canvas_result,
+        background_rgb_display,
+        preview_size,
+    )
+    coverage = float(np.mean(paint_alpha > 0.05))
+    if coverage <= 0.0005:
+        return None, None, 0.0
+
+    if paint_alpha.shape != output_size:
+        output_height, output_width = output_size
+        paint_alpha = cv2.resize(
+            paint_alpha,
+            (output_width, output_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    allowed_mask = make_alignment_allowed_mask(paint_alpha)
+    return paint_alpha, allowed_mask, float(np.mean(paint_alpha > 0.05))
+
+
+def _render_preview_and_mask(
+    preview: PreviewResult,
+    *,
+    can_process: bool,
+) -> tuple[object | None, np.ndarray | None, bool]:
+    """Render reference preview, sharpness plot, and mask canvas."""
+    st.subheader("Reference and Alignment Guide")
+    st.metric("Selected reference index", preview.reference_index)
+    st.pyplot(
+        sharpness_figure(preview.sharpness_scores, preview.reference_index),
+        use_container_width=False,
+    )
+
+    if st_canvas is None:
+        reference_rgb = cv2.cvtColor(preview.reference_frame_bgr, cv2.COLOR_BGR2RGB)
+        st.image(reference_rgb, caption="Reference frame")
+        st.error(
+            "Install streamlit-drawable-canvas, then restart Streamlit to paint an alignment guide."
+        )
+        process_clicked = st.button(
+            "Process image",
+            type="primary",
+            disabled=not can_process,
+        )
+        return None, None, process_clicked
+
+    if "canvas_nonce" not in st.session_state:
+        st.session_state.canvas_nonce = 0
+
+    background_rgb_display, canvas_width, canvas_height = _canvas_background(
+        preview.reference_frame_bgr,
+        max_width=PREVIEW_RESIZE_WIDTH,
+    )
+    canvas_column, controls_column = st.columns([4, 1], gap="medium")
+    with controls_column:
+        brush_size = st.slider("Brush size", min_value=4, max_value=80, value=24, step=2)
+        if st.button("Reset mask"):
+            st.session_state.canvas_nonce += 1
+            st.session_state.pop("guided_result", None)
+        process_clicked = st.button(
+            "Process image",
+            type="primary",
+            disabled=not can_process,
+        )
+
+    with canvas_column:
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 255, 255, 0)",
+            stroke_width=brush_size,
+            stroke_color="#FFFFFF",
+            background_image=Image.fromarray(background_rgb_display),
+            update_streamlit=True,
+            height=canvas_height,
+            width=canvas_width,
+            drawing_mode="freedraw",
+            display_toolbar=False,
+            key=f"alignment_guide_canvas_{st.session_state.canvas_nonce}",
+        )
+    return canvas_result, background_rgb_display, process_clicked
+
+
+def _render_pipeline_result(result: PipelineResult, settings: PipelineSettings) -> None:
+    """Render guided pipeline output and diagnostics."""
     st.subheader("Extraction")
     _render_summary_table(
         pd.DataFrame({"Metric": ["Frames processed"], "Value": [result.frames_processed]})
     )
 
-    if result.first_frame_bgr is not None:
-        first_frame_rgb = cv2.cvtColor(result.first_frame_bgr, cv2.COLOR_BGR2RGB)
-        st.image(first_frame_rgb, caption="First extracted frame")
-
-    st.subheader("Reference Frame")
-    st.metric("Selected reference index", result.reference_index)
-    if result.reference_frame_bgr is not None:
-        reference_frame_rgb = cv2.cvtColor(
-            result.reference_frame_bgr,
-            cv2.COLOR_BGR2RGB,
-        )
-        st.image(reference_frame_rgb, caption="Reference frame")
-    st.pyplot(
-        sharpness_figure(result.sharpness_scores, result.reference_index),
-        use_container_width=False,
-    )
-
     st.subheader("Alignment")
-    metric_columns = st.columns(3)
+    metric_columns = st.columns(4)
     metric_columns[0].metric("Accepted frames", result.accepted_count)
     metric_columns[1].metric("Rejected frames", result.rejected_count)
     metric_columns[2].metric(
         "Applied minimum inlier ratio",
         f"{result.applied_min_inlier_ratio:.2f}",
     )
+    metric_columns[3].metric("Guided mask coverage", f"{result.mask_coverage:.1%}")
     st.dataframe(
         pd.DataFrame(result.alignment_diagnostics),
         hide_index=True,
@@ -316,20 +446,48 @@ def _render_pipeline_result(result: PipelineResult) -> None:
     for warning in result.warnings:
         st.warning(warning)
 
+    if st.button("Update processing / mask settings"):
+        st.session_state.pop("guided_result", None)
+        st.info("Settings are ready for review. Process the image again when set.")
+        return
+
+    selected_count = result.accepted_count
     final_bgr = (
         result.cropped_output_image_bgr
         if result.cropped_output_image_bgr is not None
         else result.output_image_bgr
     )
+    if result.alignment_results is not None and result.accepted_count > 0:
+        selected_count = st.slider(
+            "# averaged frames",
+            min_value=1,
+            max_value=result.accepted_count,
+            value=result.accepted_count,
+            step=1,
+        )
+        subset = stack_alignment_subset(
+            result.alignment_results,
+            selected_count,
+            stack_mode=settings.stack_mode,
+            sigma=settings.sigma,
+            crop_borders=settings.crop_borders,
+            valid_border_threshold=settings.valid_border_threshold,
+        )
+        final_bgr = (
+            subset.cropped_output_image_bgr
+            if subset.cropped_output_image_bgr is not None
+            else subset.output_image_bgr
+        )
+
     final_rgb = cv2.cvtColor(final_bgr, cv2.COLOR_BGR2RGB)
     _save_output_images(final_bgr)
     png_bytes = _encode_image(final_bgr, ".png")
     jpg_bytes = _encode_image(final_bgr, ".jpg")
 
-    st.subheader("Strict Photographic Full-Frame Average")
+    st.subheader("Guided Photographic Full-Frame Average")
     st.image(
         final_rgb,
-        caption="Strict photographic full-frame average",
+        caption=f"Photographic full-frame average ({selected_count} frames)",
     )
     download_columns = st.columns(2)
     download_columns[0].download_button(
@@ -360,215 +518,10 @@ def _canvas_background(reference_bgr: np.ndarray, max_width: int = 700) -> tuple
     return background_rgb_display, display_width, display_height
 
 
-def _run_selective_stack(
-    strict_result: PipelineResult,
-    strict_settings: PipelineSettings,
-    canvas_result,
-    background_rgb_display: np.ndarray,
-    strictness: float,
-    feather_radius_px: int,
-    blend_strength: float,
-) -> dict[str, object]:
-    """Run relaxed masked stacking and return display/download payloads."""
-    if strict_result.frames_bgr is None or strict_result.reference_frame_bgr is None:
-        raise ValueError("Strict pipeline result does not include frames for selective mode")
-
-    output_size = strict_result.reference_frame_bgr.shape[:2]
-    paint_alpha = extract_paint_mask_from_canvas(
-        canvas_result,
-        background_rgb_display,
-        output_size,
-    )
-    allowed_mask = make_alignment_allowed_mask(paint_alpha)
-    paint_coverage = float(np.mean(paint_alpha > 0.05))
-    allowed_coverage = float(np.mean(allowed_mask > 0))
-    relaxed_settings = relaxed_stack_settings(strictness, strict_settings)
-    selective_stack = run_stack_job(
-        strict_result.frames_bgr,
-        strict_result.reference_index,
-        relaxed_settings,
-        alignment_allowed_mask=allowed_mask,
-    )
-
-    reference_bgr = strict_result.reference_frame_bgr
-    motion_stack_bgr = selective_stack.cropped_stack_bgr
-    alpha = paint_alpha
-    if selective_stack.crop_rect is not None:
-        x_min, y_min, x_max, y_max = selective_stack.crop_rect
-        reference_bgr = reference_bgr[y_min:y_max, x_min:x_max]
-        alpha = alpha[y_min:y_max, x_min:x_max]
-
-    feathered_alpha = feather_mask(alpha, feather_radius_px)
-    blended_bgr = blend_with_alpha(
-        reference_bgr,
-        motion_stack_bgr,
-        feathered_alpha,
-        blend_strength,
-    )
-
-    return {
-        "reference_bgr": reference_bgr,
-        "motion_stack_bgr": motion_stack_bgr,
-        "alpha": feathered_alpha,
-        "blend_bgr": blended_bgr,
-        "accepted_count": selective_stack.accepted_count,
-        "diagnostics": selective_stack.diagnostics,
-        "paint_coverage": paint_coverage,
-        "allowed_coverage": allowed_coverage,
-    }
-
-
-def _render_selective_workflow(
-    strict_result: PipelineResult,
-    strict_settings: PipelineSettings,
-) -> None:
-    """Render the optional selective motion blend workflow."""
-    st.subheader("Selective Motion Blend")
-    st.write(
-        "Paint over the regions where you want the long-exposure motion effect. "
-        "The app will use the unpainted regions to estimate camera alignment, "
-        "then blend the relaxed stack only into the painted region."
-    )
-
-    if st_canvas is None:
-        st.error(
-            "Install streamlit-drawable-canvas, then restart Streamlit to use mask painting."
-        )
-        return
-    if strict_result.reference_frame_bgr is None:
-        st.error("No reference frame is available for selective blending.")
-        return
-
-    if "canvas_nonce" not in st.session_state:
-        st.session_state.canvas_nonce = 0
-
-    background_rgb_display, canvas_width, canvas_height = _canvas_background(
-        strict_result.reference_frame_bgr,
-    )
-    brush_size = st.slider("Brush size", min_value=4, max_value=80, value=24, step=2)
-    if st.button("Reset mask"):
-        st.session_state.canvas_nonce += 1
-        st.session_state.pop("selective_payload", None)
-
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 255, 255, 0)",
-        stroke_width=brush_size,
-        stroke_color="#FFFFFF",
-        background_image=Image.fromarray(background_rgb_display),
-        update_streamlit=True,
-        height=canvas_height,
-        width=canvas_width,
-        drawing_mode="freedraw",
-        key=f"motion_mask_canvas_{st.session_state.canvas_nonce}",
-    )
-
-    strictness = st.slider(
-        "Frame acceptance strictness",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.35,
-        step=0.05,
-    )
-    feather_radius_px = st.slider(
-        "Feather radius",
-        min_value=0,
-        max_value=80,
-        value=18,
-        step=2,
-    )
-    blend_strength = st.slider(
-        "Blend strength",
-        min_value=0.0,
-        max_value=1.0,
-        value=1.0,
-        step=0.05,
-    )
-
-    if st.button("Generate / update selective stack", type="primary"):
-        selective_payload = _run_selective_stack(
-            strict_result,
-            strict_settings,
-            canvas_result,
-            background_rgb_display,
-            strictness,
-            feather_radius_px,
-            blend_strength,
-        )
-        st.session_state.selective_payload = selective_payload
-
-    selective_payload = st.session_state.get("selective_payload")
-    if not selective_payload:
-        return
-
-    reference_rgb = cv2.cvtColor(
-        selective_payload["reference_bgr"],
-        cv2.COLOR_BGR2RGB,
-    )
-    motion_rgb = cv2.cvtColor(
-        selective_payload["motion_stack_bgr"],
-        cv2.COLOR_BGR2RGB,
-    )
-    alpha_display = (selective_payload["alpha"] * 255).astype(np.uint8)
-    blend_bgr = selective_payload["blend_bgr"]
-    blend_rgb = cv2.cvtColor(blend_bgr, cv2.COLOR_BGR2RGB)
-
-    st.image(reference_rgb, caption="Reference image")
-    st.image(motion_rgb, caption="Relaxed motion stack")
-    st.image(alpha_display, caption="Alpha mask")
-    st.image(blend_rgb, caption="Selective motion blend")
-
-    strict_ratio = (
-        selective_payload["accepted_count"] / strict_result.accepted_count
-        if strict_result.accepted_count > 0
-        else 0.0
-    )
-    metric_columns = st.columns(3)
-    metric_columns[0].metric("Strict accepted frames", strict_result.accepted_count)
-    metric_columns[1].metric(
-        "Selective accepted frames",
-        selective_payload["accepted_count"],
-    )
-    metric_columns[2].metric("Selective / strict", f"{strict_ratio:.2f}x")
-
-    mask_columns = st.columns(2)
-    mask_columns[0].metric(
-        "Painted mask coverage",
-        f"{selective_payload['paint_coverage']:.1%}",
-    )
-    mask_columns[1].metric(
-        "ORB allowed area",
-        f"{selective_payload['allowed_coverage']:.1%}",
-    )
-
-    st.dataframe(
-        pd.DataFrame(selective_payload["diagnostics"]),
-        hide_index=True,
-    )
-
-    download_columns = st.columns(3)
-    download_columns[0].download_button(
-        "Download selective PNG",
-        data=_encode_image(blend_bgr, ".png"),
-        file_name="selective_motion_blend.png",
-        mime="image/png",
-    )
-    download_columns[1].download_button(
-        "Download selective JPEG",
-        data=_encode_image(blend_bgr, ".jpg"),
-        file_name="selective_motion_blend.jpg",
-        mime="image/jpeg",
-    )
-    download_columns[2].download_button(
-        "Download alpha mask",
-        data=_encode_gray_png(alpha_display),
-        file_name="selective_motion_alpha.png",
-        mime="image/png",
-    )
-
-
 def main() -> None:
     """Render the Streamlit app."""
     st.set_page_config(page_title=APP_TITLE, layout="wide")
+    _inject_ui_styles()
     st.title(APP_TITLE)
     st.caption("A local portfolio lab for honest frame averaging from video.")
 
@@ -586,9 +539,11 @@ def main() -> None:
     upload_signature = (uploaded_file.name, len(uploaded_bytes))
     if st.session_state.get("upload_signature") != upload_signature:
         st.session_state.upload_signature = upload_signature
-        st.session_state.pop("strict_result", None)
-        st.session_state.pop("strict_settings", None)
-        st.session_state.pop("selective_payload", None)
+        st.session_state.pop("preview_result", None)
+        st.session_state.pop("preview_signature", None)
+        st.session_state.pop("guided_result", None)
+        st.session_state.pop("guided_settings", None)
+        st.session_state.pop("canvas_nonce", None)
 
     suffix = Path(uploaded_file.name).suffix
     video_path = save_uploaded_video_to_temp(uploaded_bytes, suffix)
@@ -599,36 +554,91 @@ def main() -> None:
         video_duration = float(summary["duration_seconds"])
         st.video(uploaded_bytes)
 
+        preview_result = st.session_state.get("preview_result")
+        frame_count_hint = (
+            preview_result.frames_processed
+            if isinstance(preview_result, PreviewResult)
+            else None
+        )
         settings = _settings_from_sidebar(
             video_width=video_width,
             video_duration=video_duration,
+            frame_count_hint=frame_count_hint,
         )
+        preview_settings = _preview_settings(settings, video_width)
+        preview_signature = (
+            upload_signature,
+            _processing_signature(preview_settings),
+        )
+        preview_is_stale = st.session_state.get("preview_signature") != preview_signature
+        with st.sidebar:
+            st.divider()
+            update_preview = st.button(
+                "Update preview",
+                type="primary" if preview_is_stale else "secondary",
+                use_container_width=True,
+            )
 
         st.subheader("Video Metadata")
         _render_summary_table(_metadata_table(summary))
 
-        if not st.button("Run pipeline", type="primary"):
-            result = st.session_state.get("strict_result")
-        else:
-            with st.status("Processing video", expanded=True) as status:
-                st.write("Extracting frames and scoring sharpness.")
-                st.write("Selecting a reference frame and aligning accepted frames.")
-                st.write("Stacking frames and cropping unstable borders.")
-                result = run_pipeline(video_path, settings)
-                st.session_state.strict_result = result
-                st.session_state.strict_settings = settings
-                st.session_state.pop("selective_payload", None)
-                status.update(label="Processing complete", state="complete")
+        if update_preview or preview_result is None:
+            with st.status("Preparing mask preview", expanded=True) as status:
+                st.write("Extracting preview frames and selecting the reference.")
+                preview_result = run_preview(video_path, preview_settings)
+                st.session_state.preview_result = preview_result
+                st.session_state.preview_signature = preview_signature
+                st.session_state.canvas_nonce = st.session_state.get("canvas_nonce", 0) + 1
+                st.session_state.pop("guided_result", None)
+                status.update(label="Preview ready", state="complete")
+            preview_is_stale = False
+        elif preview_is_stale:
+            st.warning("Preview settings changed. Update the preview before running the full pipeline.")
 
-        if result is None:
-            st.info("Adjust settings, then run the pipeline to produce the final image.")
+        if preview_result is None:
+            st.info("Update the preview to choose the reference frame and paint an alignment guide.")
             return
 
-        _render_pipeline_result(result)
-        enable_selective = st.toggle("Enable selective motion blend", value=False)
-        if enable_selective:
-            strict_settings = st.session_state.get("strict_settings", settings)
-            _render_selective_workflow(result, strict_settings)
+        preview_result = cast(PreviewResult, preview_result)
+        if preview_result.frames_processed > PREVIEW_FRAME_REFRESH_THRESHOLD and preview_is_stale:
+            st.warning("This clip uses more than 120 preview frames, so the preview needs to be refreshed before running.")
+
+        can_run_pipeline = not (
+            preview_is_stale and preview_result.frames_processed > PREVIEW_FRAME_REFRESH_THRESHOLD
+        )
+        canvas_result, background_rgb_display, process_clicked = _render_preview_and_mask(
+            preview_result,
+            can_process=can_run_pipeline,
+        )
+
+        if process_clicked:
+            alignment_allowed_mask = None
+            mask_coverage = 0.0
+            if canvas_result is not None and background_rgb_display is not None:
+                _paint_alpha, alignment_allowed_mask, mask_coverage = _extract_guidance_mask(
+                    canvas_result,
+                    background_rgb_display,
+                    preview_result.reference_frame_bgr.shape[:2],
+                    _output_size_from_metadata(summary, settings.resize_width),
+                )
+
+            with st.status("Processing video", expanded=True) as status:
+                st.write("Extracting full-resolution frames.")
+                if alignment_allowed_mask is not None:
+                    st.write(f"Using painted alignment guide ({mask_coverage:.1%} masked).")
+                st.write("Aligning accepted frames and building the full-frame average.")
+                result = run_pipeline(video_path, settings, alignment_allowed_mask)
+                st.session_state.guided_result = result
+                st.session_state.guided_settings = settings
+                status.update(label="Processing complete", state="complete")
+
+        result = st.session_state.get("guided_result")
+        result_settings = st.session_state.get("guided_settings", settings)
+        if result is None:
+            st.info("Process the image when the reference and mask are ready.")
+            return
+
+        _render_pipeline_result(cast(PipelineResult, result), cast(PipelineSettings, result_settings))
     except ValueError as error:
         st.error(str(error))
     finally:

@@ -65,7 +65,7 @@ def alignment_table(results: list[AlignmentResult]) -> pd.DataFrame:
 
 def sharpness_figure(scores: list[float], reference_index: int) -> Figure:
     """Build a simple sharpness plot with the selected reference frame marked."""
-    figure = Figure(figsize=(8, 3.5), layout="constrained")
+    figure = Figure(figsize=(5.4, 2.4), layout="constrained")
     axis = figure.subplots()
     frame_numbers = list(range(len(scores)))
 
