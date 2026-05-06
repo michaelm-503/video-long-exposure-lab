@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import base64
+import gc
+import os
 from dataclasses import dataclass, replace
 from html import escape
 from pathlib import Path
 import shutil
 import tempfile
 import time
-from typing import cast
+import traceback
+from typing import Literal, cast
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -49,6 +52,8 @@ from longexposure.pipeline import (
 from longexposure.stacking import StackingMode
 
 
+AlignmentMode = Literal["Auto alignment", "No alignment", "Guided mask"]
+
 APP_TITLE = "Video Long Exposure Lab"
 OUTPUT_DIR = Path("outputs")
 SAMPLE_DATA_DIR = Path("sample_data")
@@ -58,6 +63,7 @@ MAX_UPLOAD_VIDEO_BYTES = 25 * 1024 * 1024
 MAX_REMOTE_VIDEO_BYTES = 250 * 1024 * 1024
 STALE_TEMP_SECONDS = 6 * 60 * 60
 APP_TEMP_ROOT = Path(tempfile.gettempdir()) / "video-long-exposure-lab"
+STREAMLIT_CLOUD_SRC_ROOT = Path("/mount/src")
 LOCAL_SAMPLE_SUFFIXES = {".m4v", ".mov", ".mp4"}
 VIDEO_MIME_TYPES = {
     ".m4v": "video/mp4",
@@ -85,6 +91,11 @@ OUTPUT_SECTION_LABELS = {
     "median": "Median Stack",
     "sigma_clipped_mean": "Sigma-Clipped Mean Stack",
 }
+ALIGNMENT_MODE_OPTIONS: list[AlignmentMode] = [
+    "Auto alignment",
+    "No alignment",
+    "Guided mask",
+]
 BEST_RESULTS_TIPS = [
     "Use full-resolution video.",
     "Keep the camera as still as possible.",
@@ -251,13 +262,72 @@ def _clear_processing_state() -> None:
         "guided_settings",
         "canvas_nonce",
         "active_upload_signature",
+        "active_alignment_mode",
     ):
         st.session_state.pop(key, None)
     _cached_video_summary.clear()
 
 
+def _diagnostics_enabled() -> bool:
+    """Return whether verbose troubleshooting logs are enabled."""
+    return bool(st.session_state.get("verbose_diagnostics", False))
+
+
+def _log_diagnostic(message: str) -> None:
+    """Write a troubleshooting message to Streamlit state and server logs."""
+    if not _diagnostics_enabled():
+        return
+
+    timestamp = time.strftime("%H:%M:%S")
+    line = f"[{timestamp}] {message}"
+    print(f"[video-long-exposure-lab] {line}", flush=True)
+
+    events = st.session_state.setdefault("diagnostic_events", [])
+    if isinstance(events, list):
+        events.append(line)
+        del events[:-80]
+
+
+def _render_diagnostics() -> None:
+    """Render recent troubleshooting events in the app."""
+    if not _diagnostics_enabled():
+        return
+
+    events = st.session_state.get("diagnostic_events", [])
+    if not isinstance(events, list) or not events:
+        return
+
+    with st.expander("Verbose diagnostics", expanded=False):
+        st.code("\n".join(str(event) for event in events), language="text")
+
+
+def _is_streamlit_community_cloud() -> bool:
+    """Best-effort detection for Streamlit Community Cloud defaults."""
+    if os.environ.get("VIDEO_LONG_EXPOSURE_FORCE_CLOUD_MODE") == "1":
+        return True
+    if os.environ.get("VIDEO_LONG_EXPOSURE_FORCE_LOCAL_MODE") == "1":
+        return False
+    return STREAMLIT_CLOUD_SRC_ROOT.exists()
+
+
+def _default_alignment_mode() -> AlignmentMode:
+    """Return the safest alignment mode for the current runtime."""
+    return "Auto alignment" if _is_streamlit_community_cloud() else "Guided mask"
+
+
+def _clear_guided_result(reason: str) -> None:
+    """Drop the full-resolution result before another memory-heavy operation."""
+    had_result = "guided_result" in st.session_state
+    st.session_state.pop("guided_result", None)
+    st.session_state.pop("guided_settings", None)
+    if had_result:
+        _log_diagnostic(f"Cleared previous pipeline result: {reason}")
+        gc.collect()
+
+
 def _cleanup_session_temp_files() -> None:
     """Remove temp files for this session before loading a new video."""
+    _log_diagnostic("Cleaning session temp files before loading a new video.")
     temp_dir = _session_temp_dir()
     shutil.rmtree(temp_dir, ignore_errors=True)
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -701,11 +771,21 @@ def _settings_from_sidebar(
     *,
     video_duration: float,
     frame_count_hint: int | None = None,
-) -> tuple[PipelineSettings, bool]:
+) -> tuple[PipelineSettings, bool, AlignmentMode]:
     """Collect Streamlit sidebar controls into pipeline settings."""
     default_min_matches = _target_min_matches(frame_count_hint)
 
     with st.sidebar:
+        st.header("Diagnostics")
+        verbose_diagnostics = st.checkbox(
+            "Verbose diagnostics",
+            value=bool(st.session_state.get("verbose_diagnostics", False)),
+            help="Write detailed processing status to the app and Streamlit Cloud logs.",
+        )
+        st.session_state.verbose_diagnostics = verbose_diagnostics
+        if not verbose_diagnostics:
+            st.session_state.pop("diagnostic_events", None)
+
         st.header("Processing")
         max_frames = st.slider(
             "Maximum frames",
@@ -748,14 +828,34 @@ def _settings_from_sidebar(
         )
 
         st.header("Alignment")
-        enable_alignment = st.checkbox(
-            "Enable alignment",
-            value=True,
-            help=(
-                "For tripod star trails, disable alignment so the stars can trail. "
-                "If using alignment for night scenes, guide it with static foreground."
+        default_alignment_mode = _default_alignment_mode()
+        alignment_mode = cast(
+            AlignmentMode,
+            st.selectbox(
+                "Alignment mode",
+                options=ALIGNMENT_MODE_OPTIONS,
+                index=ALIGNMENT_MODE_OPTIONS.index(default_alignment_mode),
+                key="alignment_mode_control",
+                help=(
+                    "Auto alignment uses the whole frame for ORB matching. "
+                    "No alignment is best for tripod star trails. Guided mask "
+                    "uses a local/experimental paint canvas."
+                ),
             ),
         )
+        st.session_state.alignment_mode = alignment_mode
+        if alignment_mode == "Guided mask" and _is_streamlit_community_cloud():
+            st.warning(
+                "Guided mask is experimental on Streamlit Community Cloud. "
+                "The reference image may not appear behind the canvas."
+            )
+        enable_alignment = alignment_mode != "No alignment"
+        if alignment_mode == "No alignment":
+            st.caption("Alignment is disabled so motion can accumulate naturally.")
+        elif alignment_mode == "Auto alignment":
+            st.caption("Alignment uses the whole frame as the valid matching region.")
+        else:
+            st.caption("Paint static regions to guide alignment; unpainted means whole-frame alignment.")
         orb_max_features = st.number_input(
             "Max ORB features",
             min_value=100,
@@ -856,7 +956,7 @@ def _settings_from_sidebar(
         crop_borders=bool(crop_borders),
         valid_border_threshold=float(valid_border_threshold),
     )
-    return settings, update_preview
+    return settings, update_preview, alignment_mode
 
 
 def _preview_settings(settings: PipelineSettings, video_width: int) -> PipelineSettings:
@@ -990,15 +1090,26 @@ def _render_preview_and_mask(
     can_process: bool,
 ) -> tuple[object | None, np.ndarray | None, bool]:
     """Render reference preview, sharpness plot, and mask canvas."""
-    st.subheader("Reference and Alignment Guide")
+    alignment_mode = cast(AlignmentMode, st.session_state.get("alignment_mode", _default_alignment_mode()))
+    running_on_cloud = _is_streamlit_community_cloud()
+    st.subheader("Reference and Alignment")
     st.metric("Selected reference index", preview.reference_index)
     st.pyplot(
         sharpness_figure(preview.sharpness_scores, preview.reference_index),
         use_container_width=False,
     )
+    reference_rgb = cv2.cvtColor(preview.reference_frame_bgr, cv2.COLOR_BGR2RGB)
+
+    if alignment_mode != "Guided mask":
+        st.image(reference_rgb, caption="Reference frame")
+        process_clicked = st.button(
+            "Process image",
+            type="primary",
+            disabled=not can_process,
+        )
+        return None, None, process_clicked
 
     if st_canvas is None:
-        reference_rgb = cv2.cvtColor(preview.reference_frame_bgr, cv2.COLOR_BGR2RGB)
         st.image(reference_rgb, caption="Reference frame")
         st.error(
             "Install streamlit-drawable-canvas, then restart Streamlit to paint an alignment guide."
@@ -1017,32 +1128,49 @@ def _render_preview_and_mask(
         preview.reference_frame_bgr,
         max_width=PREVIEW_RESIZE_WIDTH,
     )
-    canvas_column, controls_column = st.columns([4, 1], gap="medium")
+    if running_on_cloud:
+        st.warning(
+            "Guided mask is experimental on Streamlit Community Cloud. The reference image may "
+            "not appear behind the canvas, so use the reference panel while painting the mask."
+        )
+
+    reference_column, canvas_column, controls_column = st.columns([3, 3, 1], gap="medium")
     with controls_column:
         brush_size = st.slider("Brush size", min_value=4, max_value=128, value=64, step=4)
         if st.button("Reset mask"):
             st.session_state.canvas_nonce += 1
-            st.session_state.pop("guided_result", None)
+            _clear_guided_result("mask reset")
         process_clicked = st.button(
             "Process image",
             type="primary",
             disabled=not can_process,
         )
 
+    with reference_column:
+        st.image(reference_rgb, caption="Reference frame")
+
     with canvas_column:
+        canvas_kwargs = {
+            "fill_color": "rgba(255, 255, 255, 0)",
+            "stroke_width": brush_size,
+            "stroke_color": "#FFFFFF",
+            "update_streamlit": True,
+            "height": canvas_height,
+            "width": canvas_width,
+            "drawing_mode": "freedraw",
+            "display_toolbar": False,
+            "key": f"alignment_guide_canvas_{st.session_state.canvas_nonce}",
+        }
+        mask_background_rgb = None
+        if running_on_cloud:
+            canvas_kwargs["background_color"] = "#111111"
+        else:
+            canvas_kwargs["background_image"] = Image.fromarray(background_rgb_display)
+            mask_background_rgb = background_rgb_display
         canvas_result = st_canvas(
-            fill_color="rgba(255, 255, 255, 0)",
-            stroke_width=brush_size,
-            stroke_color="#FFFFFF",
-            background_image=Image.fromarray(background_rgb_display),
-            update_streamlit=True,
-            height=canvas_height,
-            width=canvas_width,
-            drawing_mode="freedraw",
-            display_toolbar=False,
-            key=f"alignment_guide_canvas_{st.session_state.canvas_nonce}",
+            **canvas_kwargs,
         )
-    return canvas_result, background_rgb_display, process_clicked
+    return canvas_result, mask_background_rgb, process_clicked
 
 
 def _render_pipeline_result(result: PipelineResult, settings: PipelineSettings) -> None:
@@ -1207,10 +1335,13 @@ def main() -> None:
             if isinstance(preview_result, PreviewResult)
             else None
         )
-        settings, update_preview = _settings_from_sidebar(
+        settings, update_preview, alignment_mode = _settings_from_sidebar(
             video_duration=video_duration,
             frame_count_hint=frame_count_hint,
         )
+        if st.session_state.get("active_alignment_mode") != alignment_mode:
+            _clear_guided_result("alignment mode changed")
+            st.session_state.active_alignment_mode = alignment_mode
         preview_settings = _preview_settings(settings, video_width)
         preview_signature = _preview_signature(
             selected_video.signature,
@@ -1229,13 +1360,25 @@ def main() -> None:
         _render_best_results()
 
         if update_preview or preview_result is None:
+            _clear_guided_result("preview refresh")
+            _log_diagnostic(
+                "Starting preview: "
+                f"path_exists={selected_video.video_path.exists()} "
+                f"path={selected_video.video_path} "
+                f"settings={preview_settings}"
+            )
             with st.status("Preparing mask preview", expanded=True) as status:
                 st.write("Extracting preview frames and selecting the reference.")
                 preview_result = run_preview(selected_video.video_path, preview_settings)
                 st.session_state.preview_result = preview_result
                 st.session_state.preview_signature = preview_signature
                 st.session_state.canvas_nonce = st.session_state.get("canvas_nonce", 0) + 1
-                st.session_state.pop("guided_result", None)
+                _clear_guided_result("preview completed")
+                _log_diagnostic(
+                    "Preview ready: "
+                    f"frames={preview_result.frames_processed} "
+                    f"reference={preview_result.reference_index}"
+                )
                 status.update(label="Preview ready", state="complete")
             preview_is_stale = False
         elif preview_is_stale:
@@ -1256,11 +1399,19 @@ def main() -> None:
             preview_result,
             can_process=can_run_pipeline,
         )
+        _log_diagnostic(
+            "Rendered preview controls: "
+            f"alignment_mode={alignment_mode} "
+            f"preview_stale={preview_is_stale} "
+            f"can_run_pipeline={can_run_pipeline} "
+            f"process_clicked={process_clicked}"
+        )
 
         if process_clicked:
+            _clear_guided_result("new process image click")
             alignment_allowed_mask = None
             mask_coverage = 0.0
-            if canvas_result is not None and background_rgb_display is not None:
+            if alignment_mode == "Guided mask" and canvas_result is not None:
                 _paint_alpha, alignment_allowed_mask, mask_coverage = _extract_guidance_mask(
                     canvas_result,
                     background_rgb_display,
@@ -1268,6 +1419,18 @@ def main() -> None:
                     _output_size_from_metadata(summary, settings.resize_width),
                 )
 
+            if not selected_video.video_path.exists():
+                raise ValueError("The temporary video file is missing. Reload the video and try again.")
+
+            _log_diagnostic(
+                "Starting full pipeline: "
+                f"path_exists={selected_video.video_path.exists()} "
+                f"path={selected_video.video_path} "
+                f"alignment_mode={alignment_mode} "
+                f"mask_coverage={mask_coverage:.4f} "
+                f"has_alignment_mask={alignment_allowed_mask is not None} "
+                f"settings={settings}"
+            )
             with st.status("Processing video", expanded=True) as status:
                 st.write("Extracting full-resolution frames.")
                 if alignment_allowed_mask is not None:
@@ -1280,6 +1443,13 @@ def main() -> None:
                 )
                 st.session_state.guided_result = result
                 st.session_state.guided_settings = settings
+                _log_diagnostic(
+                    "Pipeline complete: "
+                    f"frames={result.frames_processed} "
+                    f"accepted={result.accepted_count} "
+                    f"rejected={result.rejected_count} "
+                    f"warnings={len(result.warnings)}"
+                )
                 status.update(label="Processing complete", state="complete")
 
         result = st.session_state.get("guided_result")
@@ -1290,10 +1460,18 @@ def main() -> None:
 
         _render_pipeline_result(cast(PipelineResult, result), cast(PipelineSettings, result_settings))
     except ValueError as error:
+        _log_diagnostic(f"User-facing error: {error}")
         st.error(str(error))
+    except Exception as error:  # pragma: no cover - defensive Cloud troubleshooting path
+        _log_diagnostic(f"Unexpected error: {error}")
+        if _diagnostics_enabled():
+            print(traceback.format_exc(), flush=True)
+        st.error("Something went wrong while processing this video. Enable verbose diagnostics, retry, and check the Streamlit Cloud logs.")
     finally:
         if selected_video is not None and selected_video.cleanup_path:
+            _log_diagnostic(f"Removing upload temp file: {selected_video.video_path}")
             selected_video.video_path.unlink(missing_ok=True)
+        _render_diagnostics()
 
 
 if __name__ == "__main__":
