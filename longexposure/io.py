@@ -19,9 +19,13 @@ def save_uploaded_video(uploaded_bytes: bytes, destination: Path) -> Path:
     return destination
 
 
-def save_uploaded_video_to_temp(uploaded_bytes: bytes, suffix: str) -> Path:
+def save_uploaded_video_to_temp(
+    uploaded_bytes: bytes,
+    suffix: str,
+    temp_dir: Path | None = None,
+) -> Path:
     """Write uploaded video bytes to a temporary file for OpenCV."""
-    with NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+    with NamedTemporaryFile(delete=False, suffix=suffix, dir=temp_dir) as temp_file:
         return save_uploaded_video(uploaded_bytes, Path(temp_file.name))
 
 

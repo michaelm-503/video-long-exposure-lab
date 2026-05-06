@@ -1,98 +1,95 @@
 # Video Long Exposure Lab
 
-Video Long Exposure Lab is a local Streamlit portfolio project for turning a
-short video into a long-exposure-style still image.
+A Streamlit app that converts short video clips into long-exposure
+still images using transparent frame alignment and photographic averaging.
 
-The app is designed around an honest photographic process:
+## Motivation
 
-1. Extract frames from an uploaded video.
-2. Choose a reference frame.
-3. Align frames to that reference.
-4. Reject frames that do not align well.
-5. Average accepted aligned frames.
-6. Crop unstable borders.
-7. Export the final image.
+iOS Photos can turn Live Photos into a long-exposure image, but handheld clips
+often blur because the app does not always compensate for camera motion robustly.
+Dedicated long-exposure apps usually require deciding at capture time, while
+traditional daytime long-exposure photography asks for a tripod and neutral
+density filters.
 
-## Honest Photographic Average Mode
+Video Long Exposure Lab explores a reproducible alternative: take an ordinary
+short video, make the alignment/rejection decisions visible, and produce an
+honest still image from the frames that actually align.
 
-The core visual idea is a real average of video frames, not a synthetic blur or
-AI-generated image. Each accepted frame contributes light and color to the final
-still after being aligned to the chosen reference view.
+## What It Does
 
-This approach can create water, sky, traffic, crowd, and handheld motion effects
-that resemble long-exposure photography while preserving a clear relationship to
-the source video.
+The app runs a full local computer-vision pipeline:
 
-## Stacking Modes
+1. Upload a `.mov`, `.mp4`, or `.m4v`, or choose a hosted demo clip.
+2. Extract frames from a selected time window.
+3. Score frame sharpness and select a reference frame.
+4. Optionally paint an alignment exclusion mask.
+5. Align frames with ORB feature matching and a RANSAC affine transform.
+6. Reject poorly aligned frames by match count and inlier ratio.
+7. Stack accepted frames.
+8. Crop unstable borders.
+9. Export PNG or JPEG output.
+10. Show diagnostics for sharpness, acceptance, inlier ratio, and warnings.
 
-- Mean photographic average: best for waterfalls, streams, clouds, and smoothing
-  motion.
-- Median: useful for cleanup, but it suppresses transient motion.
-- Sigma-clipped mean: cleanup-oriented averaging for noisy or inconsistent
-  frames.
-- Lighten / star trails: preserves the brightest pixel/channel values for star
-  trails, light trails, and fireworks.
-- Additive / sum: experimental brightening mode that can saturate highlights
-  quickly.
+## Honest Photographic Mode
 
-## How To Get Best Results
+The default output is a full-frame aligned average. The app does not replace only
+the water, sky, or traffic region with a synthetic blur. Every accepted frame
+contributes to the full image after alignment.
 
-- Use full-resolution video.
-- Keep the camera as still as possible.
-- Include static rocks, trees, buildings, or landscape for alignment.
-- Avoid extreme parallax between foreground and background.
-- Avoid heavy wind in foliage when it is needed for alignment.
-- Use 2-5 seconds for waterfalls and streams.
-- For tripod star trails, disable alignment so the stars can trail naturally.
-  If alignment is needed for a night landscape, guide it with static foreground
-  rather than stars.
+That constraint is intentional. It keeps the result tied to the source video and
+makes artifacts easier to reason about. If the source clip is soft, compressed,
+or badly aligned, the app explains that instead of hiding the tradeoff.
 
-## Demo Gallery
+## Optional Computational Modes
 
-The app includes a Demo Gallery mode so a hosted portfolio deployment can explain
-the available sample sources even when the visitor does not upload a video.
+The default mode is mean photographic averaging, but the app also exposes a few
+controlled alternatives:
 
-The repository does not commit large media files. Demo mode supports:
+- `Sigma-clipped mean`: reduces outlier frames or noisy pixel values.
+- `Median`: suppresses transient motion and can be useful for cleanup.
+- `Lighten / star trails`: keeps the brightest pixel/channel values for night
+  photography, light trails, fireworks, and star trails.
+- `Additive / sum`: sums frames with gain control, useful experimentally but
+  easy to saturate.
+- `Alignment exclusion mask`: lets the user paint moving regions, such as
+  water, that should not be used to estimate camera motion.
 
-- hosted sample clips from
-  [Demo Media v1](https://github.com/michaelm-503/predictive-maintenance-risk-dashboard/releases/tag/demo-media-v1)
-- local videos placed in `sample_data/`
-- direct remote video URLs for `.mp4`, `.mov`, or `.m4v` files
+For tripod star trails, alignment can be disabled so the stars move naturally
+through the stack. If alignment is used for night scenes, it should be guided by
+static foreground rather than stars.
 
-The hosted demo clips are GitHub Release assets, which gives the app stable
-direct `.mp4`/`.mov` URLs without storing large media in git history.
+## Why Results May Be Soft
 
-## Limitations
+This is not super-resolution. Even good alignment cannot fully repair:
 
-- Video frames are compressed, often noisy, and usually lower quality than still
-  photos.
-- Moving subjects can become transparent or smeared when averaged.
-- Large camera movement, rolling shutter, parallax, and scene changes can break
-  alignment.
-- Alignment can stabilize the camera view, but it cannot invent detail that was
-  not captured in the original frames.
-- Low-resolution or blurred source video will still look soft after averaging.
-- Additive stacking can clip bright highlights quickly.
+- source video compression
+- rolling shutter distortion
+- autofocus or exposure shifts
+- hand motion inside individual frames
+- parallax between foreground and background
+- wind or moving foliage in alignment regions
+- low shutter speed blur already baked into the video frames
 
-## Why Video May Still Be Soft After Alignment
+Averaging can reduce random noise and smooth motion, but it can also reveal small
+alignment errors as softness. The diagnostics are there to make those tradeoffs
+visible.
 
-Even good alignment cannot fully undo motion blur, compression artifacts,
-rolling shutter distortion, missed focus, low shutter speed, atmospheric haze, or
-the lower per-frame resolution of many videos. Averaging can reduce random noise,
-but it can also reveal small alignment errors as softness. The goal is a
-photographically honest result, not a super-resolution reconstruction.
+## Technical Stack
+
+- Streamlit for the local interactive UI
+- OpenCV for frame extraction, ORB features, RANSAC transforms, warping, and
+  image encoding
+- NumPy for frame stacking and mask operations
+- Matplotlib for diagnostic plots
+- Pandas for alignment tables and summary data
 
 ## Run Locally
 
-Create the conda environment:
+Install dependencies:
 
 ```bash
-conda create -n long-exposure-lab -c conda-forge python=3.12 streamlit opencv numpy pillow imageio imageio-ffmpeg pandas matplotlib
-conda activate long-exposure-lab
+pip install -r requirements.txt
 ```
-
-Alternatively, create the environment with Python 3.12 and install the pinned
-application requirements with `pip install -r requirements.txt`.
 
 Start the app:
 
@@ -100,15 +97,36 @@ Start the app:
 streamlit run app.py
 ```
 
-All processing happens locally in the Streamlit runtime. The app does not use
-deep learning, cloud APIs, or remote processing services.
+All processing happens locally in the Streamlit runtime. Uploaded files are
+written only to temporary local files for OpenCV processing and are not
+intentionally persisted by the app.
+
+## Hosted Demo Caveats
+
+The app includes a demo gallery backed by GitHub Release assets:
+
+[Demo Media v1](https://github.com/michaelm-503/predictive-maintenance-risk-dashboard/releases/tag/demo-media-v1)
+
+Hosted demos are intentionally small so they load and process in a portfolio
+context. Short clips are recommended, especially at full resolution. Larger
+videos increase download time, memory use, and processing latency.
+
+The repository does not commit large media files. For local testing, additional
+`.mp4`, `.mov`, or `.m4v` samples can be placed in `sample_data/`.
 
 ## Portfolio Framing
 
-This project is intentionally scoped as a portfolio lab rather than a production
-SaaS app. The interesting work is in making the photographic pipeline visible:
-frame extraction, reference choice, alignment quality, rejection decisions,
-averaging, border handling, and export.
+This project is about building a reproducible, explainable computer-vision
+pipeline rather than a black-box image effect.
 
-Good future improvements include sample videos with documented tradeoffs,
-presets for common shooting scenarios, and richer export controls.
+The main design choices were:
+
+- deterministic processing over hidden enhancement
+- transparent diagnostics over silent failure
+- constrained modes with clear tradeoffs
+- local-first processing and no cloud dependency
+- visible artifacts that can be explained by frame quality, alignment, masking,
+  and stacking choices
+
+The result is a compact portfolio case study in turning a playful photographic
+idea into a debuggable image-processing workflow.

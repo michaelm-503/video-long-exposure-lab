@@ -1,9 +1,9 @@
 streamlit==1.40.0
-opencv-python-headless
-numpy
-pillow
-imageio
-imageio-ffmpeg
-pandas
-matplotlib
+opencv-python-headless==4.13.0.92
+numpy==2.4.3
+pillow==11.3.0
+imageio==2.37.0
+imageio-ffmpeg==0.6.0
+pandas==2.3.3
+matplotlib==3.10.9
 streamlit-drawable-canvas==0.9.3

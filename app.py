@@ -6,10 +6,14 @@ import base64
 from dataclasses import dataclass, replace
 from html import escape
 from pathlib import Path
+import shutil
 import tempfile
+import time
 from typing import cast
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+import uuid
 
 import cv2
 import numpy as np
@@ -50,7 +54,10 @@ OUTPUT_DIR = Path("outputs")
 SAMPLE_DATA_DIR = Path("sample_data")
 PREVIEW_RESIZE_WIDTH = 800
 PREVIEW_FRAME_REFRESH_THRESHOLD = 120
+MAX_UPLOAD_VIDEO_BYTES = 25 * 1024 * 1024
 MAX_REMOTE_VIDEO_BYTES = 250 * 1024 * 1024
+STALE_TEMP_SECONDS = 6 * 60 * 60
+APP_TEMP_ROOT = Path(tempfile.gettempdir()) / "video-long-exposure-lab"
 LOCAL_SAMPLE_SUFFIXES = {".m4v", ".mov", ".mp4"}
 VIDEO_MIME_TYPES = {
     ".m4v": "video/mp4",
@@ -195,10 +202,90 @@ class VideoSelection:
 
     name: str
     suffix: str
-    video_bytes: bytes
+    video_bytes: bytes | None
     video_path: Path
     signature: tuple[object, ...]
     cleanup_path: bool
+
+
+def _session_temp_id() -> str:
+    """Return a stable per-session ID for temp file isolation."""
+    if "temp_session_id" not in st.session_state:
+        st.session_state.temp_session_id = uuid.uuid4().hex
+    return cast(str, st.session_state.temp_session_id)
+
+
+def _session_temp_dir() -> Path:
+    """Return this user's temp directory for video files."""
+    session_id = _session_temp_id()
+    _prune_stale_session_temp_dirs(session_id)
+    temp_dir = APP_TEMP_ROOT / session_id
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    return temp_dir
+
+
+def _prune_stale_session_temp_dirs(current_session_id: str) -> None:
+    """Remove abandoned session temp directories from previous Cloud sessions."""
+    if not APP_TEMP_ROOT.exists():
+        return
+
+    now = time.time()
+    for path in APP_TEMP_ROOT.iterdir():
+        if path.name == current_session_id or not path.is_dir():
+            continue
+        try:
+            if now - path.stat().st_mtime > STALE_TEMP_SECONDS:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def _clear_processing_state() -> None:
+    """Clear cached results tied to the active video."""
+    for key in (
+        "demo_video_selection",
+        "video_signature",
+        "preview_result",
+        "preview_signature",
+        "guided_result",
+        "guided_settings",
+        "canvas_nonce",
+        "active_upload_signature",
+    ):
+        st.session_state.pop(key, None)
+    _cached_video_summary.clear()
+
+
+def _cleanup_session_temp_files() -> None:
+    """Remove temp files for this session before loading a new video."""
+    temp_dir = _session_temp_dir()
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    _clear_processing_state()
+
+
+def _write_session_temp_video(video_bytes: bytes, suffix: str) -> Path:
+    """Write video bytes into the current session's temp directory."""
+    temp_file = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=suffix,
+        dir=_session_temp_dir(),
+    )
+    try:
+        temp_file.write(video_bytes)
+    finally:
+        temp_file.close()
+    return Path(temp_file.name)
+
+
+def _video_bytes_for_display(selection: VideoSelection) -> bytes:
+    """Return video bytes for the HTML preview without storing demos in session."""
+    if selection.video_bytes is not None:
+        return selection.video_bytes
+    try:
+        return selection.video_path.read_bytes()
+    except OSError as error:
+        raise ValueError("The temporary video file is no longer available. Load the video again.") from error
 
 
 def _inject_ui_styles() -> None:
@@ -284,7 +371,7 @@ def _load_local_video(path: Path) -> VideoSelection:
     return VideoSelection(
         name=path.name,
         suffix=path.suffix,
-        video_bytes=path.read_bytes(),
+        video_bytes=None,
         video_path=path,
         signature=("local", str(path.resolve()), stat.st_size, stat.st_mtime_ns),
         cleanup_path=False,
@@ -302,27 +389,39 @@ def _download_video_url(url: str) -> VideoSelection:
         url,
         headers={"User-Agent": "video-long-exposure-lab/1.0"},
     )
-    with urlopen(request, timeout=45) as response:
-        content_type = response.headers.get("Content-Type", "").lower()
-        content_length = response.headers.get("Content-Length")
-        if content_length and int(content_length) > MAX_REMOTE_VIDEO_BYTES:
-            raise ValueError("Remote video is larger than the demo download limit.")
-        if not content_type.startswith("video/") and suffix not in LOCAL_SAMPLE_SUFFIXES:
-            raise ValueError(
-                "That link did not look like a direct video file. Open the source page, "
-                "copy a direct .mp4/.mov/.m4v video URL, or place the clip in sample_data/."
+    try:
+        with urlopen(request, timeout=45) as response:
+            content_type = response.headers.get("Content-Type", "").lower()
+            content_length = response.headers.get("Content-Length")
+            content_length_bytes = (
+                int(content_length) if content_length and content_length.isdigit() else 0
             )
-
-        chunks: list[bytes] = []
-        bytes_read = 0
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            bytes_read += len(chunk)
-            if bytes_read > MAX_REMOTE_VIDEO_BYTES:
+            if content_length_bytes > MAX_REMOTE_VIDEO_BYTES:
                 raise ValueError("Remote video is larger than the demo download limit.")
-            chunks.append(chunk)
+            if not content_type.startswith("video/") and suffix not in LOCAL_SAMPLE_SUFFIXES:
+                raise ValueError(
+                    "That link did not look like a direct video file. Open the source page, "
+                    "copy a direct .mp4/.mov/.m4v video URL, or place the clip in sample_data/."
+                )
+
+            chunks: list[bytes] = []
+            bytes_read = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                if bytes_read > MAX_REMOTE_VIDEO_BYTES:
+                    raise ValueError("Remote video is larger than the demo download limit.")
+                chunks.append(chunk)
+    except HTTPError as error:
+        raise ValueError(f"Could not download the video URL: HTTP {error.code}.") from error
+    except URLError as error:
+        raise ValueError(f"Could not download the video URL: {error.reason}.") from error
+    except TimeoutError as error:
+        raise ValueError("Could not download the video URL before the connection timed out.") from error
+    except OSError as error:
+        raise ValueError(f"Could not download the video URL: {error}.") from error
 
     video_bytes = b"".join(chunks)
     if not video_bytes:
@@ -336,17 +435,13 @@ def _download_video_url(url: str) -> VideoSelection:
         else:
             suffix = ".mp4"
 
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    try:
-        temp_file.write(video_bytes)
-    finally:
-        temp_file.close()
+    video_path = _write_session_temp_video(video_bytes, suffix)
 
     return VideoSelection(
         name=Path(parsed.path).name or "remote-demo-video",
         suffix=suffix,
-        video_bytes=video_bytes,
-        video_path=Path(temp_file.name),
+        video_bytes=None,
+        video_path=video_path,
         signature=("remote", url, len(video_bytes)),
         cleanup_path=False,
     )
@@ -425,6 +520,7 @@ def _render_demo_source_cards() -> VideoSelection | None:
                 key=f"use_demo_{source['filename']}",
                 use_container_width=True,
             ):
+                _cleanup_session_temp_files()
                 return _download_video_url(source["url"])
     return None
 
@@ -452,6 +548,7 @@ def _render_demo_gallery() -> VideoSelection | None:
                 format_func=lambda path: path.name,
             )
             if st.button("Use local sample", type="primary"):
+                _cleanup_session_temp_files()
                 return _load_local_video(selected_local)
         else:
             st.info("Place .mp4, .mov, or .m4v files in sample_data/ to use them here.")
@@ -464,6 +561,7 @@ def _render_demo_gallery() -> VideoSelection | None:
             placeholder="https://example.com/sample.mp4",
         )
         if st.button("Load video URL", type="primary"):
+            _cleanup_session_temp_files()
             return _download_video_url(direct_url)
 
     return st.session_state.get("demo_video_selection")
@@ -487,19 +585,28 @@ def _render_video_input() -> VideoSelection | None:
         "Upload a short video",
         type=["mov", "mp4", "m4v"],
         accept_multiple_files=False,
+        help="Use clips up to 25 MB. For Streamlit Cloud, 2K or smaller video is strongly recommended.",
     )
     if uploaded_file is None:
         return None
 
     uploaded_bytes = uploaded_file.getvalue()
+    if len(uploaded_bytes) > MAX_UPLOAD_VIDEO_BYTES:
+        raise ValueError("Upload a video that is 25 MB or smaller for the Streamlit demo.")
+
     suffix = Path(uploaded_file.name).suffix
-    video_path = save_uploaded_video_to_temp(uploaded_bytes, suffix)
+    upload_signature = ("upload", uploaded_file.name, len(uploaded_bytes))
+    if st.session_state.get("active_upload_signature") != upload_signature:
+        _cleanup_session_temp_files()
+        st.session_state.active_upload_signature = upload_signature
+
+    video_path = save_uploaded_video_to_temp(uploaded_bytes, suffix, _session_temp_dir())
     return VideoSelection(
         name=uploaded_file.name,
         suffix=suffix,
         video_bytes=uploaded_bytes,
         video_path=video_path,
-        signature=("upload", uploaded_file.name, len(uploaded_bytes)),
+        signature=upload_signature,
         cleanup_path=True,
     )
 
@@ -1089,7 +1196,7 @@ def main() -> None:
         video_width = int(summary["width"])
         video_duration = float(summary["duration_seconds"])
         _render_video(
-            selected_video.video_bytes,
+            _video_bytes_for_display(selected_video),
             suffix=selected_video.suffix,
             video_width=video_width,
         )
@@ -1114,6 +1221,11 @@ def main() -> None:
 
         st.subheader("Video Metadata")
         _render_summary_table(_metadata_table(summary))
+        if max(video_width, int(summary["height"])) > 2048:
+            st.warning(
+                "For the hosted Streamlit demo, 2K or smaller video is recommended. "
+                "4K clips may run out of memory during full-resolution processing."
+            )
         _render_best_results()
 
         if update_preview or preview_result is None:
