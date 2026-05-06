@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import replace
 from html import escape
 from pathlib import Path
@@ -32,6 +33,7 @@ from longexposure.pipeline import (
     run_preview,
     run_pipeline,
     stack_alignment_subset,
+    stackable_alignment_order,
 )
 from longexposure.stacking import StackingMode
 
@@ -40,6 +42,11 @@ APP_TITLE = "Video Long Exposure Lab"
 OUTPUT_DIR = Path("outputs")
 PREVIEW_RESIZE_WIDTH = 800
 PREVIEW_FRAME_REFRESH_THRESHOLD = 120
+VIDEO_MIME_TYPES = {
+    ".m4v": "video/mp4",
+    ".mov": "video/quicktime",
+    ".mp4": "video/mp4",
+}
 STACKING_MODE_LABELS: dict[str, StackingMode] = {
     "Mean": "mean",
     "Sigma-clipped mean (cleanup)": "sigma_clipped_mean",
@@ -52,22 +59,11 @@ def _inject_ui_styles() -> None:
     st.markdown(
         """
         <style>
-            div[data-testid="stVideo"],
-            .stVideo {
-                display: inline-block;
-                width: fit-content;
+            video.content-sized-video {
+                display: block;
                 max-width: 100%;
-            }
-            div[data-testid="stVideo"] > div,
-            .stVideo > div {
-                width: fit-content !important;
-                max-width: 100%;
-            }
-            div[data-testid="stVideo"] video,
-            .stVideo video {
-                width: auto !important;
-                max-width: 100% !important;
                 max-height: 70vh;
+                height: auto;
             }
         </style>
         """,
@@ -100,6 +96,27 @@ def _save_output_images(image_bgr: np.ndarray) -> tuple[Path, Path]:
     cv2.imwrite(str(png_path), image_bgr)
     cv2.imwrite(str(jpg_path), image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
     return png_path, jpg_path
+
+
+def _render_video(
+    video_bytes: bytes,
+    *,
+    suffix: str,
+    video_width: int,
+) -> None:
+    """Render video at its intrinsic width or shrink to fit."""
+    encoded_video = base64.b64encode(video_bytes).decode("ascii")
+    mime_type = VIDEO_MIME_TYPES.get(suffix.lower(), "video/mp4")
+    max_width = min(PREVIEW_RESIZE_WIDTH, max(1, video_width))
+    st.markdown(
+        f"""
+        <video class="content-sized-video" controls preload="metadata"
+            style="width: min({max_width}px, 100%);">
+            <source src="data:{mime_type};base64,{encoded_video}" type="{mime_type}">
+        </video>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -175,15 +192,19 @@ def _render_summary_table(table: pd.DataFrame) -> None:
     )
 
 
+def _target_min_matches(frame_count_hint: int | None) -> int:
+    """Return the default alignment target: half the frames, capped at 60."""
+    estimated_frames = frame_count_hint or 20
+    return max(3, min(60, round(estimated_frames * 0.5)))
+
+
 def _settings_from_sidebar(
     *,
-    video_width: int,
     video_duration: float,
     frame_count_hint: int | None = None,
-) -> PipelineSettings:
+) -> tuple[PipelineSettings, bool]:
     """Collect Streamlit sidebar controls into pipeline settings."""
-    default_resize_width = video_width if video_width > 0 else 1
-    default_min_matches = max(10, round((frame_count_hint or 20) * 0.5))
+    default_min_matches = _target_min_matches(frame_count_hint)
 
     with st.sidebar:
         st.header("Processing")
@@ -199,13 +220,6 @@ def _settings_from_sidebar(
             min_value=1,
             max_value=60,
             value=1,
-            step=1,
-        )
-        resize_width = st.number_input(
-            "Resize width",
-            min_value=1,
-            max_value=max(1, video_width),
-            value=max(1, default_resize_width),
             step=1,
         )
         start_time_s = st.number_input(
@@ -228,6 +242,11 @@ def _settings_from_sidebar(
                 index=0,
             ),
         )
+        update_preview = st.button(
+            "Update preview",
+            type="secondary",
+            use_container_width=True,
+        )
 
         st.header("Alignment")
         orb_max_features = st.number_input(
@@ -244,19 +263,30 @@ def _settings_from_sidebar(
             value=200,
             step=10,
         )
+        if (
+            st.session_state.get("min_matches_target") != default_min_matches
+            or st.session_state.get("min_matches", default_min_matches) > 60
+        ):
+            st.session_state.min_matches = default_min_matches
+            st.session_state.min_matches_target = default_min_matches
         min_matches = st.number_input(
             "Minimum matches",
             min_value=3,
-            max_value=500,
-            value=default_min_matches,
+            max_value=60,
+            key="min_matches",
             step=1,
         )
         min_inlier_ratio = st.slider(
-            "Minimum inlier ratio",
+            "Minimum inlier ratio (0.00 = Auto)",
             min_value=0.0,
             max_value=1.0,
-            value=1.0,
+            value=0.0,
             step=0.01,
+            help=(
+                "Set to 0.00 for auto mode. Auto starts at 1.00 and steps down "
+                "until the minimum-match target is met. Any other value is a "
+                "fixed cutoff."
+            ),
         )
         ransac_reproj_threshold = st.number_input(
             "RANSAC reprojection threshold",
@@ -289,12 +319,12 @@ def _settings_from_sidebar(
             step=0.01,
         )
 
-    return PipelineSettings(
+    settings = PipelineSettings(
         start_time_s=float(start_time_s),
         duration_s=float(duration_s),
         max_frames=int(max_frames),
         frame_stride=int(frame_stride),
-        resize_width=int(resize_width),
+        resize_width=None,
         reference_strategy=reference_strategy,
         orb_max_features=int(orb_max_features),
         orb_keep_matches=int(orb_keep_matches),
@@ -306,6 +336,7 @@ def _settings_from_sidebar(
         crop_borders=bool(crop_borders),
         valid_border_threshold=float(valid_border_threshold),
     )
+    return settings, update_preview
 
 
 def _preview_settings(settings: PipelineSettings, video_width: int) -> PipelineSettings:
@@ -314,9 +345,22 @@ def _preview_settings(settings: PipelineSettings, video_width: int) -> PipelineS
     return replace(settings, resize_width=preview_width)
 
 
-def _processing_signature(settings: PipelineSettings) -> tuple[object, ...]:
-    """Return the setting values that should invalidate preview/results."""
-    return tuple(settings.__dict__.items())
+def _preview_signature(
+    upload_signature: tuple[str, int],
+    settings: PipelineSettings,
+    video_width: int,
+) -> tuple[object, ...]:
+    """Return only the values that affect preview extraction/reference selection."""
+    preview_width = min(PREVIEW_RESIZE_WIDTH, video_width) if video_width > 0 else PREVIEW_RESIZE_WIDTH
+    return (
+        upload_signature,
+        settings.start_time_s,
+        settings.duration_s,
+        settings.max_frames,
+        settings.frame_stride,
+        settings.reference_strategy,
+        preview_width,
+    )
 
 
 def _output_size_from_metadata(
@@ -396,7 +440,7 @@ def _render_preview_and_mask(
     )
     canvas_column, controls_column = st.columns([4, 1], gap="medium")
     with controls_column:
-        brush_size = st.slider("Brush size", min_value=4, max_value=80, value=24, step=2)
+        brush_size = st.slider("Brush size", min_value=4, max_value=128, value=64, step=4)
         if st.button("Reset mask"):
             st.session_state.canvas_nonce += 1
             st.session_state.pop("guided_result", None)
@@ -446,11 +490,6 @@ def _render_pipeline_result(result: PipelineResult, settings: PipelineSettings) 
     for warning in result.warnings:
         st.warning(warning)
 
-    if st.button("Update processing / mask settings"):
-        st.session_state.pop("guided_result", None)
-        st.info("Settings are ready for review. Process the image again when set.")
-        return
-
     selected_count = result.accepted_count
     final_bgr = (
         result.cropped_output_image_bgr
@@ -458,11 +497,13 @@ def _render_pipeline_result(result: PipelineResult, settings: PipelineSettings) 
         else result.output_image_bgr
     )
     if result.alignment_results is not None and result.accepted_count > 0:
+        stackable_count = len(stackable_alignment_order(result.alignment_results))
+        initial_count = min(result.accepted_count, stackable_count)
         selected_count = st.slider(
             "# averaged frames",
             min_value=1,
-            max_value=result.accepted_count,
-            value=result.accepted_count,
+            max_value=stackable_count,
+            value=initial_count,
             step=1,
         )
         subset = stack_alignment_subset(
@@ -484,7 +525,7 @@ def _render_pipeline_result(result: PipelineResult, settings: PipelineSettings) 
     png_bytes = _encode_image(final_bgr, ".png")
     jpg_bytes = _encode_image(final_bgr, ".jpg")
 
-    st.subheader("Guided Photographic Full-Frame Average")
+    st.subheader("Photographic Full-Frame Average")
     st.image(
         final_rgb,
         caption=f"Photographic full-frame average ({selected_count} frames)",
@@ -552,7 +593,8 @@ def main() -> None:
         summary = _cached_video_summary(str(video_path))
         video_width = int(summary["width"])
         video_duration = float(summary["duration_seconds"])
-        st.video(uploaded_bytes)
+        suffix = Path(uploaded_file.name).suffix
+        _render_video(uploaded_bytes, suffix=suffix, video_width=video_width)
 
         preview_result = st.session_state.get("preview_result")
         frame_count_hint = (
@@ -560,24 +602,17 @@ def main() -> None:
             if isinstance(preview_result, PreviewResult)
             else None
         )
-        settings = _settings_from_sidebar(
-            video_width=video_width,
+        settings, update_preview = _settings_from_sidebar(
             video_duration=video_duration,
             frame_count_hint=frame_count_hint,
         )
         preview_settings = _preview_settings(settings, video_width)
-        preview_signature = (
+        preview_signature = _preview_signature(
             upload_signature,
-            _processing_signature(preview_settings),
+            settings,
+            video_width,
         )
         preview_is_stale = st.session_state.get("preview_signature") != preview_signature
-        with st.sidebar:
-            st.divider()
-            update_preview = st.button(
-                "Update preview",
-                type="primary" if preview_is_stale else "secondary",
-                use_container_width=True,
-            )
 
         st.subheader("Video Metadata")
         _render_summary_table(_metadata_table(summary))
@@ -593,7 +628,7 @@ def main() -> None:
                 status.update(label="Preview ready", state="complete")
             preview_is_stale = False
         elif preview_is_stale:
-            st.warning("Preview settings changed. Update the preview before running the full pipeline.")
+            st.warning("Preview settings changed. Update the preview before processing the image.")
 
         if preview_result is None:
             st.info("Update the preview to choose the reference frame and paint an alignment guide.")
@@ -601,7 +636,7 @@ def main() -> None:
 
         preview_result = cast(PreviewResult, preview_result)
         if preview_result.frames_processed > PREVIEW_FRAME_REFRESH_THRESHOLD and preview_is_stale:
-            st.warning("This clip uses more than 120 preview frames, so the preview needs to be refreshed before running.")
+            st.warning("This clip uses more than 120 preview frames, so the preview needs to be refreshed before processing.")
 
         can_run_pipeline = not (
             preview_is_stale and preview_result.frames_processed > PREVIEW_FRAME_REFRESH_THRESHOLD

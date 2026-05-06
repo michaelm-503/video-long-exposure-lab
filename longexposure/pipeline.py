@@ -25,6 +25,7 @@ from longexposure.stacking import (
 )
 
 INLIER_RATIO_RELAX_STEP = 0.05
+AUTO_INLIER_RATIO_SENTINEL = 0.0
 
 
 @dataclass(frozen=True)
@@ -174,6 +175,26 @@ def _relax_inlier_ratio(
     return threshold, adjusted_results
 
 
+def _resolve_inlier_ratio_threshold(
+    alignment_results: list[AlignmentResult],
+    requested_threshold: float,
+    target_accepted_frames: int,
+) -> tuple[float, list[AlignmentResult]]:
+    """Apply explicit thresholding or auto-relax from 1.0 when requested."""
+    bounded_threshold = float(np.clip(requested_threshold, 0.0, 1.0))
+    if bounded_threshold == AUTO_INLIER_RATIO_SENTINEL:
+        return _relax_inlier_ratio(
+            alignment_results,
+            1.0,
+            target_accepted_frames,
+        )
+
+    return bounded_threshold, _apply_inlier_ratio_threshold(
+        alignment_results,
+        bounded_threshold,
+    )
+
+
 def _result_warnings(
     settings: PipelineSettings,
     accepted_count: int,
@@ -187,7 +208,12 @@ def _result_warnings(
             "Accepted frame count stayed below the minimum target after relaxing "
             "the inlier-ratio threshold."
         )
-    if applied_min_inlier_ratio < settings.min_inlier_ratio:
+    if settings.min_inlier_ratio == AUTO_INLIER_RATIO_SENTINEL:
+        warnings.append(
+            f"Auto inlier ratio selected {applied_min_inlier_ratio:.2f} "
+            "to meet the minimum-match target."
+        )
+    elif applied_min_inlier_ratio < settings.min_inlier_ratio:
         warnings.append(
             f"Inlier ratio was relaxed from {settings.min_inlier_ratio:.2f} "
             f"to {applied_min_inlier_ratio:.2f}."
@@ -269,6 +295,32 @@ def accepted_alignment_order(alignment_results: list[AlignmentResult]) -> list[i
     return reference_indices + aligned_indices
 
 
+def stackable_alignment_order(alignment_results: list[AlignmentResult]) -> list[int]:
+    """Return transformable result indices in quality order for the output slider."""
+    stackable_indices = [
+        index
+        for index, result in enumerate(alignment_results)
+        if result.status == "reference" or result.matrix is not None
+    ]
+    reference_indices = [
+        index for index in stackable_indices if alignment_results[index].status == "reference"
+    ]
+    aligned_indices = [
+        index
+        for index in stackable_indices
+        if alignment_results[index].status != "reference"
+    ]
+    aligned_indices.sort(
+        key=lambda index: (
+            alignment_results[index].inlier_ratio,
+            alignment_results[index].inliers,
+            alignment_results[index].matches,
+        ),
+        reverse=True,
+    )
+    return reference_indices + aligned_indices
+
+
 def stack_alignment_subset(
     alignment_results: list[AlignmentResult],
     frame_count: int,
@@ -278,8 +330,8 @@ def stack_alignment_subset(
     crop_borders: bool = True,
     valid_border_threshold: float = 0.98,
 ) -> StackSubsetResult:
-    """Stack the top accepted aligned frames by inlier quality."""
-    ordered_indices = accepted_alignment_order(alignment_results)
+    """Stack the top transformable aligned frames by inlier quality."""
+    ordered_indices = stackable_alignment_order(alignment_results)
     bounded_count = max(1, min(frame_count, len(ordered_indices)))
     selected_indices = ordered_indices[:bounded_count]
     selected_results = [alignment_results[index] for index in selected_indices]
@@ -324,7 +376,7 @@ def run_stack_job(
         alignment_settings,
         alignment_allowed_mask=alignment_allowed_mask,
     )
-    applied_min_inlier_ratio, alignment_results = _relax_inlier_ratio(
+    applied_min_inlier_ratio, alignment_results = _resolve_inlier_ratio_threshold(
         raw_alignment_results,
         stack_settings.min_inlier_ratio,
         stack_settings.min_matches,

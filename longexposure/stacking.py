@@ -10,6 +10,7 @@ import numpy as np
 from longexposure.alignment import AlignmentResult
 
 StackingMode = Literal["mean", "sigma_clipped_mean", "median"]
+MAX_STACK_CHUNK_BYTES = 128 * 1024 * 1024
 
 
 def accepted_frames(alignment_results: list[AlignmentResult]) -> list[np.ndarray]:
@@ -22,9 +23,18 @@ def mean_stack(frames_bgr: list[np.ndarray]) -> np.ndarray:
     if not frames_bgr:
         raise ValueError("At least one accepted frame is required")
 
-    stack = np.stack(frames_bgr).astype(np.float32)
-    averaged = np.mean(stack, axis=0)
+    accumulated = np.zeros(frames_bgr[0].shape, dtype=np.float32)
+    for frame in frames_bgr:
+        accumulated += frame.astype(np.float32)
+    averaged = accumulated / len(frames_bgr)
     return np.clip(averaged, 0, 255).astype(np.uint8)
+
+
+def _chunk_height(frame_shape: tuple[int, ...], frame_count: int) -> int:
+    """Return a row chunk size that keeps temporary stack memory bounded."""
+    height, width, channels = frame_shape
+    bytes_per_row = max(1, frame_count * width * channels * np.dtype(np.float32).itemsize)
+    return max(1, min(height, MAX_STACK_CHUNK_BYTES // bytes_per_row))
 
 
 def median_stack(frames_bgr: list[np.ndarray]) -> np.ndarray:
@@ -36,9 +46,17 @@ def median_stack(frames_bgr: list[np.ndarray]) -> np.ndarray:
     if not frames_bgr:
         raise ValueError("At least one accepted frame is required")
 
-    stack = np.stack(frames_bgr).astype(np.float32)
-    median = np.median(stack, axis=0)
-    return np.clip(median, 0, 255).astype(np.uint8)
+    output = np.empty_like(frames_bgr[0])
+    rows_per_chunk = _chunk_height(frames_bgr[0].shape, len(frames_bgr))
+    for row_start in range(0, frames_bgr[0].shape[0], rows_per_chunk):
+        row_end = min(frames_bgr[0].shape[0], row_start + rows_per_chunk)
+        stack = np.stack(
+            [frame[row_start:row_end] for frame in frames_bgr],
+        ).astype(np.float32)
+        output[row_start:row_end] = np.clip(np.median(stack, axis=0), 0, 255).astype(
+            np.uint8
+        )
+    return output
 
 
 def sigma_clipped_mean_stack(
@@ -51,14 +69,21 @@ def sigma_clipped_mean_stack(
     if sigma <= 0:
         raise ValueError("sigma must be greater than zero")
 
-    stack = np.stack(frames_bgr).astype(np.float32)
-    mean = np.mean(stack, axis=0)
-    std = np.std(stack, axis=0)
-    keep = np.abs(stack - mean) <= (sigma * std)
-    clipped_sum = np.sum(np.where(keep, stack, 0.0), axis=0)
-    clipped_count = np.maximum(np.sum(keep, axis=0), 1)
-    clipped_mean = clipped_sum / clipped_count
-    return np.clip(clipped_mean, 0, 255).astype(np.uint8)
+    output = np.empty_like(frames_bgr[0])
+    rows_per_chunk = _chunk_height(frames_bgr[0].shape, len(frames_bgr))
+    for row_start in range(0, frames_bgr[0].shape[0], rows_per_chunk):
+        row_end = min(frames_bgr[0].shape[0], row_start + rows_per_chunk)
+        stack = np.stack(
+            [frame[row_start:row_end] for frame in frames_bgr],
+        ).astype(np.float32)
+        mean = np.mean(stack, axis=0)
+        std = np.std(stack, axis=0)
+        keep = np.abs(stack - mean) <= (sigma * std)
+        clipped_sum = np.sum(stack * keep, axis=0)
+        clipped_count = np.maximum(np.sum(keep, axis=0), 1)
+        clipped_mean = clipped_sum / clipped_count
+        output[row_start:row_end] = np.clip(clipped_mean, 0, 255).astype(np.uint8)
+    return output
 
 
 def stack_frames(

@@ -186,7 +186,7 @@ def align_frames(
 
         aligned_frame = (
             warp_frame(frame, estimate.matrix, output_size)
-            if accepted and estimate.matrix is not None
+            if estimate.matrix is not None
             else frame
         )
         results.append(

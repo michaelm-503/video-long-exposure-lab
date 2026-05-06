@@ -13,6 +13,7 @@ from longexposure.pipeline import (
     run_pipeline,
     run_stack_job,
     stack_alignment_subset,
+    stackable_alignment_order,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "run_pipeline",
     "run_stack_job",
     "stack_alignment_subset",
+    "stackable_alignment_order",
 ]
