@@ -94,11 +94,11 @@ BEST_RESULTS_TIPS = [
     "Use 2-5 seconds for waterfalls and streams.",
 ]
 DEMO_RELEASE_URL = (
-    "https://github.com/michaelm-503/predictive-maintenance-risk-dashboard/"
+    "https://github.com/michaelm-503/video-long-exposure-lab/"
     "releases/tag/demo-media-v1"
 )
 DEMO_RELEASE_ASSETS_BASE = (
-    "https://github.com/michaelm-503/predictive-maintenance-risk-dashboard/"
+    "https://github.com/michaelm-503/video-long-exposure-lab/"
     "releases/download/demo-media-v1"
 )
 DEMO_SOURCES = [

@@ -105,7 +105,7 @@ intentionally persisted by the app.
 
 The app includes a demo gallery backed by GitHub Release assets:
 
-[Demo Media v1](https://github.com/michaelm-503/predictive-maintenance-risk-dashboard/releases/tag/demo-media-v1)
+[Demo Media v1](https://github.com/michaelm-503/video-long-exposure-lab/releases/tag/demo-media-v1)
 
 Hosted demos are intentionally small so they load and process in a portfolio
 context. Short clips are recommended, especially at full resolution. Larger

@@ -15,7 +15,7 @@ repo small and avoids redistributing media that may have separate license terms.
 The app's Demo Gallery can use:
 
 - hosted clips from the project's demo media release:
-  https://github.com/michaelm-503/predictive-maintenance-risk-dashboard/releases/tag/demo-media-v1
+  https://github.com/michaelm-503/video-long-exposure-lab/releases/tag/demo-media-v1
 - local files placed in this directory
 - direct remote video URLs that end in `.mp4`, `.mov`, or `.m4v`
 
