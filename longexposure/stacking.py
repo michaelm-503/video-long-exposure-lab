@@ -120,16 +120,29 @@ def crop_to_valid_region(
     valid_threshold: float = 0.98,
 ) -> np.ndarray:
     """Crop an image to the bounding rectangle of the stable valid mask."""
+    crop_rect = valid_region_crop_rect(alignment_results, valid_threshold)
+    if crop_rect is None:
+        return image_bgr
+
+    x_min, y_min, x_max, y_max = crop_rect
+    return image_bgr[y_min:y_max, x_min:x_max]
+
+
+def valid_region_crop_rect(
+    alignment_results: list[AlignmentResult],
+    valid_threshold: float = 0.98,
+) -> tuple[int, int, int, int] | None:
+    """Return the stable crop rectangle as x_min, y_min, x_max, y_max."""
     mask = valid_region_mask(alignment_results, valid_threshold)
     rows = np.where(mask.any(axis=1))[0]
     columns = np.where(mask.any(axis=0))[0]
 
     if rows.size == 0 or columns.size == 0:
-        return image_bgr
+        return None
 
     y_min, y_max = int(rows[0]), int(rows[-1]) + 1
     x_min, x_max = int(columns[0]), int(columns[-1]) + 1
-    return image_bgr[y_min:y_max, x_min:x_max]
+    return x_min, y_min, x_max, y_max
 
 
 def crop_unstable_borders(

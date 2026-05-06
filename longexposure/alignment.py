@@ -51,6 +51,7 @@ def estimate_transform_orb(
     max_features: int = 1500,
     keep_matches: int = 200,
     ransac_reproj_threshold: float = 3.0,
+    feature_mask: np.ndarray | None = None,
 ) -> TransformEstimate:
     """Estimate a partial affine transform from a moving frame to a reference."""
     if reference_bgr.shape[:2] != moving_bgr.shape[:2]:
@@ -58,10 +59,18 @@ def estimate_transform_orb(
 
     reference_gray = cv2.cvtColor(reference_bgr, cv2.COLOR_BGR2GRAY)
     moving_gray = cv2.cvtColor(moving_bgr, cv2.COLOR_BGR2GRAY)
+    orb_mask = None
+    if feature_mask is not None:
+        if feature_mask.shape != reference_gray.shape:
+            return TransformEstimate(None, 0, 0, 0.0, "feature mask shape mismatch")
+        orb_mask = feature_mask.astype(np.uint8)
 
     orb = cv2.ORB_create(nfeatures=max_features)
-    reference_keypoints, reference_descriptors = orb.detectAndCompute(reference_gray, None)
-    moving_keypoints, moving_descriptors = orb.detectAndCompute(moving_gray, None)
+    reference_keypoints, reference_descriptors = orb.detectAndCompute(
+        reference_gray,
+        orb_mask,
+    )
+    moving_keypoints, moving_descriptors = orb.detectAndCompute(moving_gray, orb_mask)
 
     if reference_descriptors is None or moving_descriptors is None:
         return TransformEstimate(None, 0, 0, 0.0, "missing ORB descriptors")
@@ -125,6 +134,7 @@ def align_frames(
     frames: list[np.ndarray],
     reference_index: int,
     settings: AlignmentSettings | None = None,
+    alignment_allowed_mask: np.ndarray | None = None,
 ) -> list[AlignmentResult]:
     """Align a collection of BGR frames to the selected reference frame."""
     if not frames:
@@ -158,6 +168,7 @@ def align_frames(
             max_features=resolved_settings.max_features,
             keep_matches=resolved_settings.keep_matches,
             ransac_reproj_threshold=resolved_settings.ransac_reproj_threshold,
+            feature_mask=alignment_allowed_mask,
         )
 
         if estimate.matrix is None:

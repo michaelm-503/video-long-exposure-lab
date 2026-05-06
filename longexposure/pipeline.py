@@ -19,8 +19,8 @@ from longexposure.io import VideoMetadata, get_video_summary
 from longexposure.stacking import (
     StackingMode,
     accepted_frames,
-    crop_unstable_borders,
     stack_frames,
+    valid_region_crop_rect,
 )
 
 INLIER_RATIO_RELAX_STEP = 0.05
@@ -64,6 +64,37 @@ class PipelineResult:
     first_frame_bgr: np.ndarray | None = None
     reference_frame_bgr: np.ndarray | None = None
     applied_min_inlier_ratio: float = 0.0
+    frames_bgr: list[np.ndarray] | None = None
+
+
+@dataclass(frozen=True)
+class StackJobSettings:
+    """Settings for rerunning alignment and stacking against extracted frames."""
+
+    orb_max_features: int = 1500
+    orb_keep_matches: int = 200
+    min_matches: int = 10
+    min_inlier_ratio: float = 1.0
+    ransac_reproj_threshold: float = 3.0
+    stack_mode: StackingMode = "mean"
+    sigma: float = 2.5
+    crop_borders: bool = True
+    valid_border_threshold: float = 0.98
+
+
+@dataclass(frozen=True)
+class StackJobResult:
+    """Result from aligning and stacking already-extracted frames."""
+
+    stack_image_bgr: np.ndarray
+    cropped_reference_bgr: np.ndarray
+    cropped_stack_bgr: np.ndarray
+    crop_rect: tuple[int, int, int, int] | None
+    accepted_count: int
+    rejected_count: int
+    diagnostics: list[dict[str, object]]
+    alignment_results: list[AlignmentResult]
+    applied_min_inlier_ratio: float
 
 
 def _apply_inlier_ratio_threshold(
@@ -149,6 +180,104 @@ def _result_warnings(
     return warnings
 
 
+def stack_settings_from_pipeline(settings: PipelineSettings) -> StackJobSettings:
+    """Build stack-job settings from full pipeline settings."""
+    return StackJobSettings(
+        orb_max_features=settings.orb_max_features,
+        orb_keep_matches=settings.orb_keep_matches,
+        min_matches=settings.min_matches,
+        min_inlier_ratio=settings.min_inlier_ratio,
+        ransac_reproj_threshold=settings.ransac_reproj_threshold,
+        stack_mode=settings.stack_mode,
+        sigma=settings.sigma,
+        crop_borders=settings.crop_borders,
+        valid_border_threshold=settings.valid_border_threshold,
+    )
+
+
+def relaxed_stack_settings(strictness: float, settings: PipelineSettings) -> StackJobSettings:
+    """Map selective strictness to relaxed alignment settings."""
+    bounded = float(np.clip(strictness, 0.0, 1.0))
+    return StackJobSettings(
+        orb_max_features=2500,
+        orb_keep_matches=350,
+        min_matches=round(8 + bounded * 22),
+        min_inlier_ratio=0.12 + bounded * 0.38,
+        ransac_reproj_threshold=6.0 - bounded * 3.0,
+        stack_mode=settings.stack_mode,
+        sigma=settings.sigma,
+        crop_borders=False,
+        valid_border_threshold=settings.valid_border_threshold,
+    )
+
+
+def _crop_image(image_bgr: np.ndarray, crop_rect: tuple[int, int, int, int] | None) -> np.ndarray:
+    """Crop an image by x_min, y_min, x_max, y_max when a crop rect exists."""
+    if crop_rect is None:
+        return image_bgr
+
+    x_min, y_min, x_max, y_max = crop_rect
+    return image_bgr[y_min:y_max, x_min:x_max]
+
+
+def run_stack_job(
+    frames: list[np.ndarray],
+    reference_index: int,
+    stack_settings: StackJobSettings,
+    alignment_allowed_mask: np.ndarray | None = None,
+) -> StackJobResult:
+    """Align and stack already-extracted frames against the selected reference."""
+    alignment_settings = AlignmentSettings(
+        max_features=stack_settings.orb_max_features,
+        keep_matches=stack_settings.orb_keep_matches,
+        min_matches=stack_settings.min_matches,
+        min_inlier_ratio=0.0,
+        ransac_reproj_threshold=stack_settings.ransac_reproj_threshold,
+    )
+    raw_alignment_results = align_frames(
+        frames,
+        reference_index,
+        alignment_settings,
+        alignment_allowed_mask=alignment_allowed_mask,
+    )
+    applied_min_inlier_ratio, alignment_results = _relax_inlier_ratio(
+        raw_alignment_results,
+        stack_settings.min_inlier_ratio,
+        stack_settings.min_matches,
+    )
+    accepted_aligned_frames = accepted_frames(alignment_results)
+    accepted_count = len(accepted_aligned_frames)
+    rejected_count = len(alignment_results) - accepted_count
+    stack_image_bgr = stack_frames(
+        accepted_aligned_frames,
+        stack_settings.stack_mode,
+        stack_settings.sigma,
+    )
+
+    crop_rect = None
+    if stack_settings.crop_borders:
+        crop_rect = valid_region_crop_rect(
+            alignment_results,
+            stack_settings.valid_border_threshold,
+        )
+
+    reference_bgr = frames[reference_index]
+    cropped_reference_bgr = _crop_image(reference_bgr, crop_rect)
+    cropped_stack_bgr = _crop_image(stack_image_bgr, crop_rect)
+
+    return StackJobResult(
+        stack_image_bgr=stack_image_bgr,
+        cropped_reference_bgr=cropped_reference_bgr,
+        cropped_stack_bgr=cropped_stack_bgr,
+        crop_rect=crop_rect,
+        accepted_count=accepted_count,
+        rejected_count=rejected_count,
+        diagnostics=alignment_table(alignment_results).to_dict("records"),
+        alignment_results=alignment_results,
+        applied_min_inlier_ratio=applied_min_inlier_ratio,
+    )
+
+
 def run_pipeline(video_path: str | Path, settings: PipelineSettings) -> PipelineResult:
     """Run video extraction, reference selection, alignment, stacking, and crop."""
     resolved_path = Path(video_path)
@@ -168,42 +297,22 @@ def run_pipeline(video_path: str | Path, settings: PipelineSettings) -> Pipeline
         settings.reference_strategy,
     )
 
-    alignment_settings = AlignmentSettings(
-        max_features=settings.orb_max_features,
-        keep_matches=settings.orb_keep_matches,
-        min_matches=settings.min_matches,
-        min_inlier_ratio=0.0,
-        ransac_reproj_threshold=settings.ransac_reproj_threshold,
+    stack_job = run_stack_job(
+        frames_bgr,
+        reference_index,
+        stack_settings_from_pipeline(settings),
     )
-    raw_alignment_results = align_frames(frames_bgr, reference_index, alignment_settings)
-    applied_min_inlier_ratio, alignment_results = _relax_inlier_ratio(
-        raw_alignment_results,
-        settings.min_inlier_ratio,
-        settings.min_matches,
-    )
-    accepted_aligned_frames = accepted_frames(alignment_results)
-    accepted_count = len(accepted_aligned_frames)
-    rejected_count = len(alignment_results) - accepted_count
-
-    output_image_bgr = stack_frames(
-        accepted_aligned_frames,
-        settings.stack_mode,
-        settings.sigma,
-    )
+    accepted_count = stack_job.accepted_count
+    rejected_count = stack_job.rejected_count
+    output_image_bgr = stack_job.stack_image_bgr
     cropped_output_image_bgr: np.ndarray | None = None
-    if settings.crop_borders:
-        cropped = crop_unstable_borders(
-            output_image_bgr,
-            alignment_results,
-            settings.valid_border_threshold,
-        )
-        if cropped.shape != output_image_bgr.shape:
-            cropped_output_image_bgr = cropped
+    if stack_job.crop_rect is not None:
+        cropped_output_image_bgr = stack_job.cropped_stack_bgr
 
     warnings = _result_warnings(
         settings,
         accepted_count,
-        applied_min_inlier_ratio,
+        stack_job.applied_min_inlier_ratio,
         cropped_output_image_bgr,
     )
 
@@ -212,7 +321,7 @@ def run_pipeline(video_path: str | Path, settings: PipelineSettings) -> Pipeline
         frames_processed=frames_processed,
         reference_index=reference_index,
         sharpness_scores=sharpness_scores,
-        alignment_diagnostics=alignment_table(alignment_results).to_dict("records"),
+        alignment_diagnostics=stack_job.diagnostics,
         accepted_count=accepted_count,
         rejected_count=rejected_count,
         output_image_bgr=output_image_bgr,
@@ -220,5 +329,6 @@ def run_pipeline(video_path: str | Path, settings: PipelineSettings) -> Pipeline
         warnings=warnings,
         first_frame_bgr=frames_bgr[0] if frames_bgr else None,
         reference_frame_bgr=reference_frame_bgr,
-        applied_min_inlier_ratio=applied_min_inlier_ratio,
+        applied_min_inlier_ratio=stack_job.applied_min_inlier_ratio,
+        frames_bgr=frames_bgr,
     )
