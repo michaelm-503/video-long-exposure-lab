@@ -776,166 +776,166 @@ def _settings_from_sidebar(
     default_min_matches = _target_min_matches(frame_count_hint)
 
     with st.sidebar:
-        st.header("Diagnostics")
-        verbose_diagnostics = st.checkbox(
-            "Verbose diagnostics",
-            value=bool(st.session_state.get("verbose_diagnostics", False)),
-            help="Write detailed processing status to the app and Streamlit Cloud logs.",
-        )
-        st.session_state.verbose_diagnostics = verbose_diagnostics
-        if not verbose_diagnostics:
-            st.session_state.pop("diagnostic_events", None)
-
-        st.header("Processing")
-        max_frames = st.slider(
-            "Maximum frames",
-            min_value=5,
-            max_value=300,
-            value=300,
-            step=5,
-        )
-        frame_stride = st.number_input(
-            "Frame stride",
-            min_value=1,
-            max_value=60,
-            value=1,
-            step=1,
-        )
-        start_time_s = st.number_input(
-            "Start time seconds",
-            min_value=0.0,
-            value=0.0,
-            step=0.5,
-        )
-        duration_s = st.number_input(
-            "Duration seconds to process",
-            min_value=0.1,
-            value=video_duration if video_duration > 0 else 3.0,
-            step=0.5,
-        )
-        reference_strategy = cast(
-            ReferenceStrategy,
-            st.selectbox(
-                "Reference strategy",
-                options=["median", "sharpest", "middle", "first"],
-                index=0,
-            ),
-        )
-        update_preview = st.button(
-            "Update preview",
-            type="secondary",
-            use_container_width=True,
-        )
-
-        st.header("Alignment")
-        default_alignment_mode = _default_alignment_mode()
-        alignment_mode = cast(
-            AlignmentMode,
-            st.selectbox(
-                "Alignment mode",
-                options=ALIGNMENT_MODE_OPTIONS,
-                index=ALIGNMENT_MODE_OPTIONS.index(default_alignment_mode),
-                key="alignment_mode_control",
-                help=(
-                    "Auto alignment uses the whole frame for ORB matching. "
-                    "No alignment is best for tripod star trails. Guided mask "
-                    "uses a local/experimental paint canvas."
-                ),
-            ),
-        )
-        st.session_state.alignment_mode = alignment_mode
-        if alignment_mode == "Guided mask" and _is_streamlit_community_cloud():
-            st.warning(
-                "Guided mask is experimental on Streamlit Community Cloud. "
-                "The reference image may not appear behind the canvas."
+        with st.expander("Processing", expanded=True):
+            max_frames = st.slider(
+                "Maximum frames",
+                min_value=5,
+                max_value=300,
+                value=300,
+                step=5,
             )
-        enable_alignment = alignment_mode != "No alignment"
-        if alignment_mode == "No alignment":
-            st.caption("Alignment is disabled so motion can accumulate naturally.")
-        elif alignment_mode == "Auto alignment":
-            st.caption("Alignment uses the whole frame as the valid matching region.")
-        else:
-            st.caption("Paint static regions to guide alignment; unpainted means whole-frame alignment.")
-        orb_max_features = st.number_input(
-            "Max ORB features",
-            min_value=100,
-            max_value=5000,
-            value=1500,
-            step=100,
-        )
-        orb_keep_matches = st.number_input(
-            "Keep top matches",
-            min_value=10,
-            max_value=1000,
-            value=200,
-            step=10,
-        )
-        if (
-            st.session_state.get("min_matches_target") != default_min_matches
-            or st.session_state.get("min_matches", default_min_matches) > 60
-        ):
-            st.session_state.min_matches = default_min_matches
-            st.session_state.min_matches_target = default_min_matches
-        min_matches = st.number_input(
-            "Minimum matches",
-            min_value=3,
-            max_value=60,
-            key="min_matches",
-            step=1,
-        )
-        min_inlier_ratio = st.slider(
-            "Minimum inlier ratio (0.00 = Auto)",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.0,
-            step=0.01,
-            help=(
-                "Set to 0.00 for auto mode. Auto starts at 1.00 and steps down "
-                "until the minimum-match target is met. Any other value is a "
-                "fixed cutoff."
-            ),
-        )
-        ransac_reproj_threshold = st.number_input(
-            "RANSAC reprojection threshold",
-            min_value=0.5,
-            max_value=20.0,
-            value=3.0,
-            step=0.5,
-        )
-
-        st.header("Stacking")
-        stacking_label = st.selectbox(
-            "Stacking mode",
-            options=list(STACKING_MODE_LABELS),
-            index=0,
-        )
-        stack_mode = STACKING_MODE_LABELS[stacking_label]
-        st.caption(STACKING_MODE_GUIDANCE[stack_mode])
-        sigma = st.number_input(
-            "Sigma clipping",
-            min_value=0.5,
-            max_value=10.0,
-            value=2.5,
-            step=0.1,
-        )
-        additive_gain = 1.0
-        if stack_mode == "additive":
-            additive_gain = st.number_input(
-                "Additive gain",
+            frame_stride = st.number_input(
+                "Frame stride",
+                min_value=1,
+                max_value=60,
+                value=1,
+                step=1,
+            )
+            start_time_s = st.number_input(
+                "Start time seconds",
                 min_value=0.0,
-                max_value=10.0,
-                value=1.0,
-                step=0.1,
-                help="Scales the summed frame values before clipping to 0..255.",
+                value=0.0,
+                step=0.5,
             )
-        crop_borders = st.checkbox("Crop borders", value=True)
-        valid_border_threshold = st.slider(
-            "Valid border threshold",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.98,
-            step=0.01,
-        )
+            duration_s = st.number_input(
+                "Duration seconds to process",
+                min_value=0.1,
+                value=video_duration if video_duration > 0 else 3.0,
+                step=0.5,
+            )
+            reference_strategy = cast(
+                ReferenceStrategy,
+                st.selectbox(
+                    "Reference strategy",
+                    options=["median", "sharpest", "middle", "first"],
+                    index=0,
+                ),
+            )
+            update_preview = st.button(
+                "Update preview",
+                type="secondary",
+                use_container_width=True,
+            )
+
+        with st.expander("Alignment", expanded=True):
+            default_alignment_mode = _default_alignment_mode()
+            alignment_mode = cast(
+                AlignmentMode,
+                st.selectbox(
+                    "Alignment mode",
+                    options=ALIGNMENT_MODE_OPTIONS,
+                    index=ALIGNMENT_MODE_OPTIONS.index(default_alignment_mode),
+                    key="alignment_mode_control",
+                    help=(
+                        "Auto alignment uses the whole frame for ORB matching. "
+                        "No alignment is best for tripod star trails. Guided mask "
+                        "uses a local/experimental paint canvas."
+                    ),
+                ),
+            )
+            st.session_state.alignment_mode = alignment_mode
+            if alignment_mode == "Guided mask" and _is_streamlit_community_cloud():
+                st.warning(
+                    "Guided mask is experimental on Streamlit Community Cloud. "
+                    "The reference image may not appear behind the canvas."
+                )
+            enable_alignment = alignment_mode != "No alignment"
+            if alignment_mode == "No alignment":
+                st.caption("Alignment is disabled so motion can accumulate naturally.")
+            elif alignment_mode == "Auto alignment":
+                st.caption("Alignment uses the whole frame as the valid matching region.")
+            else:
+                st.caption("Paint static regions to guide alignment; unpainted means whole-frame alignment.")
+            orb_max_features = st.number_input(
+                "Max ORB features",
+                min_value=100,
+                max_value=5000,
+                value=1500,
+                step=100,
+            )
+            orb_keep_matches = st.number_input(
+                "Keep top matches",
+                min_value=10,
+                max_value=1000,
+                value=200,
+                step=10,
+            )
+            if (
+                st.session_state.get("min_matches_target") != default_min_matches
+                or st.session_state.get("min_matches", default_min_matches) > 60
+            ):
+                st.session_state.min_matches = default_min_matches
+                st.session_state.min_matches_target = default_min_matches
+            min_matches = st.number_input(
+                "Minimum matches",
+                min_value=3,
+                max_value=60,
+                key="min_matches",
+                step=1,
+            )
+            min_inlier_ratio = st.slider(
+                "Minimum inlier ratio (0.00 = Auto)",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.0,
+                step=0.01,
+                help=(
+                    "Set to 0.00 for auto mode. Auto starts at 1.00 and steps down "
+                    "until the minimum-match target is met. Any other value is a "
+                    "fixed cutoff."
+                ),
+            )
+            ransac_reproj_threshold = st.number_input(
+                "RANSAC reprojection threshold",
+                min_value=0.5,
+                max_value=20.0,
+                value=3.0,
+                step=0.5,
+            )
+
+        with st.expander("Stacking", expanded=False):
+            stacking_label = st.selectbox(
+                "Stacking mode",
+                options=list(STACKING_MODE_LABELS),
+                index=0,
+            )
+            stack_mode = STACKING_MODE_LABELS[stacking_label]
+            st.caption(STACKING_MODE_GUIDANCE[stack_mode])
+            sigma = st.number_input(
+                "Sigma clipping",
+                min_value=0.5,
+                max_value=10.0,
+                value=2.5,
+                step=0.1,
+            )
+            additive_gain = 1.0
+            if stack_mode == "additive":
+                additive_gain = st.number_input(
+                    "Additive gain",
+                    min_value=0.0,
+                    max_value=10.0,
+                    value=1.0,
+                    step=0.1,
+                    help="Scales the summed frame values before clipping to 0..255.",
+                )
+            crop_borders = st.checkbox("Crop borders", value=True)
+            valid_border_threshold = st.slider(
+                "Valid border threshold",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.98,
+                step=0.01,
+            )
+
+        with st.expander("Diagnostics", expanded=False):
+            verbose_diagnostics = st.checkbox(
+                "Verbose diagnostics",
+                value=bool(st.session_state.get("verbose_diagnostics", False)),
+                help="Write detailed processing status to the app and Streamlit Cloud logs.",
+            )
+            st.session_state.verbose_diagnostics = verbose_diagnostics
+            if not verbose_diagnostics:
+                st.session_state.pop("diagnostic_events", None)
 
     settings = PipelineSettings(
         start_time_s=float(start_time_s),
@@ -1101,7 +1101,8 @@ def _render_preview_and_mask(
     reference_rgb = cv2.cvtColor(preview.reference_frame_bgr, cv2.COLOR_BGR2RGB)
 
     if alignment_mode != "Guided mask":
-        st.image(reference_rgb, caption="Reference frame")
+        st.caption("Reference frame")
+        st.image(reference_rgb)
         process_clicked = st.button(
             "Process image",
             type="primary",
@@ -1110,7 +1111,8 @@ def _render_preview_and_mask(
         return None, None, process_clicked
 
     if st_canvas is None:
-        st.image(reference_rgb, caption="Reference frame")
+        st.caption("Reference frame")
+        st.image(reference_rgb)
         st.error(
             "Install streamlit-drawable-canvas, then restart Streamlit to paint an alignment guide."
         )
@@ -1147,9 +1149,11 @@ def _render_preview_and_mask(
         )
 
     with reference_column:
-        st.image(reference_rgb, caption="Reference frame")
+        st.caption("Reference frame")
+        st.image(reference_rgb)
 
     with canvas_column:
+        st.caption("Alignment mask")
         canvas_kwargs = {
             "fill_color": "rgba(255, 255, 255, 0)",
             "stroke_width": brush_size,
