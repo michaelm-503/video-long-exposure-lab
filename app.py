@@ -262,6 +262,7 @@ def _clear_processing_state() -> None:
         "guided_settings",
         "canvas_nonce",
         "active_upload_signature",
+        "active_upload_path",
         "active_alignment_mode",
     ):
         st.session_state.pop(key, None)
@@ -660,24 +661,38 @@ def _render_video_input() -> VideoSelection | None:
     if uploaded_file is None:
         return None
 
-    uploaded_bytes = uploaded_file.getvalue()
-    if len(uploaded_bytes) > MAX_UPLOAD_VIDEO_BYTES:
+    upload_size = int(getattr(uploaded_file, "size", 0) or 0)
+    if upload_size > MAX_UPLOAD_VIDEO_BYTES:
         raise ValueError("Upload a video that is 25 MB or smaller for the Streamlit demo.")
 
     suffix = Path(uploaded_file.name).suffix
-    upload_signature = ("upload", uploaded_file.name, len(uploaded_bytes))
-    if st.session_state.get("active_upload_signature") != upload_signature:
+    upload_signature = ("upload", uploaded_file.name, upload_size)
+    active_upload_path = st.session_state.get("active_upload_path")
+    video_path = Path(active_upload_path) if isinstance(active_upload_path, str) else None
+    if (
+        st.session_state.get("active_upload_signature") != upload_signature
+        or video_path is None
+        or not video_path.exists()
+    ):
+        uploaded_bytes = uploaded_file.getvalue()
+        if len(uploaded_bytes) > MAX_UPLOAD_VIDEO_BYTES:
+            raise ValueError("Upload a video that is 25 MB or smaller for the Streamlit demo.")
         _cleanup_session_temp_files()
+        video_path = save_uploaded_video_to_temp(uploaded_bytes, suffix, _session_temp_dir())
         st.session_state.active_upload_signature = upload_signature
+        st.session_state.active_upload_path = str(video_path)
+        _log_diagnostic(f"Stored upload temp file: {video_path}")
 
-    video_path = save_uploaded_video_to_temp(uploaded_bytes, suffix, _session_temp_dir())
+    if video_path is None:
+        raise ValueError("Could not prepare the uploaded video. Upload the clip again.")
+
     return VideoSelection(
         name=uploaded_file.name,
         suffix=suffix,
-        video_bytes=uploaded_bytes,
+        video_bytes=None,
         video_path=video_path,
         signature=upload_signature,
-        cleanup_path=True,
+        cleanup_path=False,
     )
 
 
@@ -1424,6 +1439,16 @@ def main() -> None:
                     background_rgb_display,
                     preview_result.reference_frame_bgr.shape[:2],
                     _output_size_from_metadata(summary, settings.resize_width),
+                )
+
+            if mask_coverage > 0.70:
+                st.warning(
+                    "The painted mask covers most of the frame. Alignment may be weak because "
+                    "only the unpainted area is used for matching."
+                )
+                _log_diagnostic(
+                    "High guided mask coverage before pipeline: "
+                    f"mask_coverage={mask_coverage:.4f}"
                 )
 
             if not selected_video.video_path.exists():
