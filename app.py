@@ -1022,7 +1022,10 @@ def _extract_guidance_mask(
         )
 
     allowed_mask = make_alignment_allowed_mask(paint_alpha)
-    return paint_alpha, allowed_mask, float(np.mean(paint_alpha > 0.05))
+    coverage = float(np.mean(paint_alpha > 0.05))
+    if coverage >= 0.95:
+        return None, None, 0.0
+    return paint_alpha, allowed_mask, coverage
 
 
 def _crop_image_for_display(

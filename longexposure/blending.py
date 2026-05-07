@@ -25,6 +25,77 @@ def _canvas_has_drawn_objects(canvas_result) -> bool | None:
     return bool(objects)
 
 
+def _path_point(command: list[object]) -> tuple[int, int] | None:
+    """Return the endpoint from a Fabric.js path command."""
+    if len(command) < 3:
+        return None
+
+    try:
+        return int(round(float(command[-2]))), int(round(float(command[-1])))
+    except (TypeError, ValueError):
+        return None
+
+
+def _object_mask_from_canvas_json(canvas_result, output_size: tuple[int, int]) -> np.ndarray | None:
+    """Build a conservative mask from drawable-canvas object metadata."""
+    json_data = getattr(canvas_result, "json_data", None)
+    if not isinstance(json_data, dict):
+        return None
+
+    objects = json_data.get("objects")
+    if not isinstance(objects, list) or not objects:
+        return None
+
+    height, width = output_size
+    mask = np.zeros((height, width), dtype=np.uint8)
+    drew_anything = False
+    for item in objects:
+        if not isinstance(item, dict):
+            continue
+
+        drew_object = False
+        stroke_width = max(1, int(round(float(item.get("strokeWidth", 8) or 8))))
+        path = item.get("path")
+        if isinstance(path, list):
+            previous_point = None
+            for command in path:
+                if not isinstance(command, list):
+                    continue
+                point = _path_point(command)
+                if point is None:
+                    continue
+                if previous_point is not None:
+                    cv2.line(mask, previous_point, point, 255, stroke_width)
+                    drew_anything = True
+                    drew_object = True
+                previous_point = point
+
+        if drew_object:
+            continue
+
+        try:
+            left = float(item.get("left", 0.0) or 0.0)
+            top = float(item.get("top", 0.0) or 0.0)
+            item_width = float(item.get("width", 0.0) or 0.0)
+            item_height = float(item.get("height", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+
+        padding = max(2, stroke_width)
+        x_min = max(0, int(round(left - padding)))
+        y_min = max(0, int(round(top - padding)))
+        x_max = min(width, int(round(left + item_width + padding)))
+        y_max = min(height, int(round(top + item_height + padding)))
+        if x_max > x_min and y_max > y_min:
+            mask[y_min:y_max, x_min:x_max] = 255
+            drew_anything = True
+
+    if not drew_anything:
+        return None
+
+    return (mask.astype(np.float32) / 255.0).astype(np.float32)
+
+
 def extract_paint_mask_from_canvas(
     canvas_result,
     background_rgb_display: np.ndarray | None,
@@ -35,8 +106,9 @@ def extract_paint_mask_from_canvas(
     if has_drawn_objects is False:
         return _empty_mask(output_size)
 
+    object_mask = _object_mask_from_canvas_json(canvas_result, output_size)
     if canvas_result.image_data is None:
-        return _empty_mask(output_size)
+        return object_mask if object_mask is not None else _empty_mask(output_size)
 
     canvas_rgba = np.asarray(canvas_result.image_data).astype(np.uint8)
     canvas_rgb = canvas_rgba[:, :, :3]
@@ -71,6 +143,13 @@ def extract_paint_mask_from_canvas(
             (output_width, output_height),
             interpolation=cv2.INTER_LINEAR,
         )
+
+    coverage = float(np.mean(alpha > 0.05))
+    object_coverage = float(np.mean(object_mask > 0.05)) if object_mask is not None else 0.0
+    if coverage > 0.95:
+        if 0.0 < object_coverage < 0.95:
+            return object_mask
+        return _empty_mask(output_size)
 
     return np.clip(alpha, 0.0, 1.0).astype(np.float32)
 
