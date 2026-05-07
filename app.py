@@ -62,6 +62,7 @@ PREVIEW_FRAME_REFRESH_THRESHOLD = 120
 MAX_UPLOAD_VIDEO_BYTES = 25 * 1024 * 1024
 MAX_REMOTE_VIDEO_BYTES = 250 * 1024 * 1024
 STALE_TEMP_SECONDS = 6 * 60 * 60
+MAX_CLOUD_GUIDED_MASK_COVERAGE = 0.70
 APP_TEMP_ROOT = Path(tempfile.gettempdir()) / "video-long-exposure-lab"
 STREAMLIT_CLOUD_SRC_ROOT = Path("/mount/src")
 LOCAL_SAMPLE_SUFFIXES = {".m4v", ".mov", ".mp4"}
@@ -1441,15 +1442,20 @@ def main() -> None:
                     _output_size_from_metadata(summary, settings.resize_width),
                 )
 
-            if mask_coverage > 0.70:
-                st.warning(
-                    "The painted mask covers most of the frame. Alignment may be weak because "
-                    "only the unpainted area is used for matching."
+            if mask_coverage > MAX_CLOUD_GUIDED_MASK_COVERAGE:
+                message = (
+                    "The guided mask covers too much of the frame for reliable hosted alignment. "
+                    f"Current coverage is {mask_coverage:.1%}; keep it below "
+                    f"{MAX_CLOUD_GUIDED_MASK_COVERAGE:.0%}, choose Auto alignment, or use "
+                    "No alignment for tripod star trails."
                 )
                 _log_diagnostic(
-                    "High guided mask coverage before pipeline: "
+                    "High guided mask coverage blocked before pipeline: "
                     f"mask_coverage={mask_coverage:.4f}"
                 )
+                if _is_streamlit_community_cloud():
+                    raise ValueError(message)
+                st.warning(message)
 
             if not selected_video.video_path.exists():
                 raise ValueError("The temporary video file is missing. Reload the video and try again.")
